@@ -9,11 +9,13 @@ from pathlib import Path
 import threading
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
-
 try:
     import winreg
 except ImportError:
     winreg = None
+
+# Windows 隐藏命令行窗口
+CREATE_NO_WINDOW = 0x08000000 if sys.platform == 'win32' else 0
 
 MAX_SIZE_MB = 5
 MAX_SIZE_BYTES = MAX_SIZE_MB * 1024 * 1024
@@ -69,7 +71,8 @@ def find_gs():
     # 1. PATH 中直接查找
     for cmd in ['gs', 'gswin64c', 'gswin32c']:
         try:
-            r = subprocess.run([cmd, '--version'], capture_output=True, text=True, timeout=5)
+            r = subprocess.run([cmd, '--version'], capture_output=True, text=True, timeout=5,
+                              creationflags=CREATE_NO_WINDOW)
             if r.returncode == 0:
                 return cmd
         except Exception:
@@ -329,7 +332,8 @@ class PDFShrinkerApp:
                 '-dBATCH',
                 f'-sOutputFile={output_path}',
                 input_path
-            ], capture_output=True, text=True, timeout=300)
+            ], capture_output=True, text=True, timeout=300,
+               creationflags=CREATE_NO_WINDOW)
 
             if rc.returncode == 0 and os.path.exists(output_path):
                 result_size = os.path.getsize(output_path)
@@ -353,7 +357,8 @@ class PDFShrinkerApp:
             '-dBATCH',
             f'-sOutputFile={output_path}',
             input_path
-        ], capture_output=True, text=True, timeout=300)
+        ], capture_output=True, text=True, timeout=300,
+           creationflags=CREATE_NO_WINDOW)
 
         if os.path.exists(output_path):
             return os.path.getsize(output_path)
