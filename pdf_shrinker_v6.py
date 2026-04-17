@@ -14,6 +14,7 @@ MAX_SIZE_MB = 5
 MAX_SIZE_BYTES = MAX_SIZE_MB * 1024 * 1024
 
 def find_gs():
+    # 先查 PATH
     for cmd in ['gs', 'gswin64c', 'gswin32c']:
         try:
             r = subprocess.run([cmd, '--version'], capture_output=True, text=True, timeout=5)
@@ -21,6 +22,21 @@ def find_gs():
                 return cmd
         except Exception:
             continue
+
+    # 再查常见安装目录
+    install_dirs = [
+        r'C:\Program Files\gs\gs10.70\bin\gswin64c.exe',
+        r'C:\Program Files\gs\gs10.70\bin\gswin64.exe',
+        r'C:\Program Files (x86)\gs\gs10.70\bin\gswin32c.exe',
+        r'C:\Program Files\Ghostscript\gs10.70\bin\gswin64c.exe',
+        r'C:\Program Files\Ghostscript\gs10.70\bin\gswin64.exe',
+        r'C:\Program Files\gs\bin\gswin64c.exe',
+        r'C:\Program Files\Ghostscript\bin\gswin64c.exe',
+    ]
+    for path in install_dirs:
+        if os.path.exists(path):
+            return path  # 返回完整路径
+
     return None
 
 def get_desktop_folder():
