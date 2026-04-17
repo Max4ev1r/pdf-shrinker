@@ -18,12 +18,10 @@ jobs:
           python-version: '3.11'
           
       - name: Install dependencies
-        run: |
-          pip install pyinstaller pillow reportlab
+        run: pip install pypdf pillow pyinstaller
       
       - name: Build EXE
-        run: |
-          pyinstaller --onefile --windowed --name PDFShrinker pdf_shrinker.py
+        run: pyinstaller --onefile --windowed --name PDFShrinker pdf_shrinker_v2.py
       
       - name: Upload artifact
         uses: actions/upload-artifact@v4
