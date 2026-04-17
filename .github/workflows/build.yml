@@ -21,7 +21,7 @@ jobs:
         run: pip install pypdf pillow pyinstaller
       
       - name: Build EXE
-        run: pyinstaller --onefile --windowed --name PDFShrinker pdf_shrinker_v7.py
+        run: pyinstaller --onefile --windowed --noconfirm --uac-admin --name PDFShrinker pdf_shrinker_v7.py
       
       - name: Upload artifact
         uses: actions/upload-artifact@v4

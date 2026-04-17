@@ -4,7 +4,7 @@ PDF Shrinker v7 - 苹果风 UI + 自定义输出路径 + Ghostscript 压缩
 依赖: Python 3, Ghostscript
 """
 
-import os, sys, shutil, io, subprocess, json
+import os, sys, shutil, io, subprocess, json, atexit
 from pathlib import Path
 import threading
 import tkinter as tk
@@ -390,4 +390,13 @@ def main():
 
 
 if __name__ == '__main__':
+    # PyInstaller 打包后清理临时目录，避免退出时弹窗报错
+    if hasattr(sys, '_MEIPASS'):
+        tmpdir = sys._MEIPASS
+        def cleanup():
+            try:
+                shutil.rmtree(tmpdir, ignore_errors=True)
+            except Exception:
+                pass
+        atexit.register(cleanup)
     main()
