@@ -14,7 +14,10 @@ MAX_SIZE_MB = 5
 MAX_SIZE_BYTES = MAX_SIZE_MB * 1024 * 1024
 
 def find_gs():
-    # 先查 PATH
+    """在 Windows 上查找 Ghostscript，依次尝试：PATH、注册表、常见安装目录"""
+    import winreg
+
+    # 1. PATH 中直接查找
     for cmd in ['gs', 'gswin64c', 'gswin32c']:
         try:
             r = subprocess.run([cmd, '--version'], capture_output=True, text=True, timeout=5)
@@ -23,19 +26,51 @@ def find_gs():
         except Exception:
             continue
 
-    # 再查常见安装目录
-    install_dirs = [
-        r'C:\Program Files\gs\gs10.70\bin\gswin64c.exe',
-        r'C:\Program Files\gs\gs10.70\bin\gswin64.exe',
-        r'C:\Program Files (x86)\gs\gs10.70\bin\gswin32c.exe',
-        r'C:\Program Files\Ghostscript\gs10.70\bin\gswin64c.exe',
-        r'C:\Program Files\Ghostscript\gs10.70\bin\gswin64.exe',
-        r'C:\Program Files\gs\bin\gswin64c.exe',
-        r'C:\Program Files\Ghostscript\bin\gswin64c.exe',
+    # 2. Windows 注册表查找 Ghostscript 安装路径
+    reg_paths = [
+        (winreg.HKEY_LOCAL_MACHINE, r'SOFTWARE\Ghostscript'),
+        (winreg.HKEY_LOCAL_MACHINE, r'SOFTWARE\Artifex Software\Ghostscript'),
+        (winreg.HKEY_CURRENT_USER, r'SOFTWARE\Ghostscript'),
+        (winreg.HKEY_LOCAL_MACHINE, r'SOFTWARE\WOW6432Node\Ghostscript'),
     ]
-    for path in install_dirs:
-        if os.path.exists(path):
-            return path  # 返回完整路径
+    for hkey, subkey in reg_paths:
+        try:
+            key = winreg.OpenKey(hkey, subkey)
+            # 找最高版本的键
+            i = 0
+            latest_ver = None
+            latest_path = None
+            while True:
+                try:
+                    name, value, _ = winreg.EnumKey(key, i)
+                    if latest_ver is None or name > latest_ver:
+                        latest_ver = name
+                        latest_path = value
+                    i += 1
+                except OSError:
+                    break
+            winreg.CloseKey(key)
+            if latest_path:
+                for exe in ['gswin64c.exe', 'gswin64.exe', 'gswin32c.exe']:
+                    full = os.path.join(latest_path, 'bin', exe)
+                    if os.path.exists(full):
+                        return full
+        except Exception:
+            continue
+
+    # 3. 常见安装目录
+    install_dirs = [
+        r'C:\Program Files\gs\gs10.70\bin',
+        r'C:\Program Files\Ghostscript\gs10.70\bin',
+        r'C:\Program Files\gs\bin',
+        r'C:\Program Files\Ghostscript\bin',
+        r'C:\Program Files (x86)\gs\gs10.70\bin',
+    ]
+    for d in install_dirs:
+        for exe in ['gswin64c.exe', 'gswin64.exe', 'gswin32c.exe']:
+            full = os.path.join(d, exe)
+            if os.path.exists(full):
+                return full
 
     return None
 

@@ -1,102 +1,109 @@
 @echo off
 chcp 65001 >nul
+setlocal enabledelayedexpansion
 title PDF Shrinker - 启动器
 
 echo ========================================
-echo    PDF Shrinker - 自动安装器
+echo    PDF Shrinker - 自动安装器 v5
 echo ========================================
 echo.
 
-:: ===== Ghostscript 检测 =====
-set "GS_READY="
-where gs >nul 2>&1
-if %errorlevel%==0 set "GS_READY=1"
+:: ===== 查找 Ghostscript =====
+set "GS_DIR="
 
-:: 检查常见安装目录
-if not defined GS_READY (
-    if exist "C:\Program Files\gs\gs10.70\bin\gswin64c.exe" set "GS_READY=1"
-    if exist "C:\Program Files\gs\gs10.70\bin\gswin64.exe" set "GS_READY=1"
-    if exist "C:\Program Files (x86)\gs\gs10.70\bin\gswin32c.exe" set "GS_READY=1"
-    if exist "C:\Program Files\Ghostscript\gs10.70\bin\gswin64c.exe" set "GS_READY=1"
-    if exist "C:\Program Files\Ghostscript\gs10.70\bin\gswin64.exe" set "GS_READY=1"
+:: 检查 PATH
+where gs >nul 2>&1
+if %errorlevel%==0 (
+    echo [OK] Ghostscript 已就绪
+    goto :launch
 )
 
-if defined GS_READY (
-    echo [OK] Ghostscript 已安装
+:: 检查常见目录
+for %%d in (
+    "C:\Program Files\gs\gs10.70\bin"
+    "C:\Program Files\Ghostscript\gs10.70\bin"
+    "C:\Program Files\gs\bin"
+    "C:\Program Files\Ghostscript\bin"
+    "C:\Program Files (x86)\gs\gs10.70\bin"
+) do (
+    if exist "%%d\gswin64c.exe" set "GS_DIR=%%d"
+    if exist "%%d\gswin64.exe" set "GS_DIR=%%d"
+    if exist "%%d\gswin32c.exe" set "GS_DIR=%%d"
+)
+
+if defined GS_DIR (
+    echo [OK] Ghostscript 已安装（!GS_DIR!）
+    set "PATH=%PATH%;!GS_DIR!"
     goto :launch
 )
 
 echo [检测] 未找到 Ghostscript，开始安装...
 echo.
 
-:: ===== 方法1: winget =====
-echo [步骤1] 尝试 winget 安装...
+:: ===== 安装 Ghostscript =====
+:: 方法1: winget
+echo [步骤1/2] winget 安装 Ghostscript...
 winget install --id ArtifexSoftware.Ghostscript -e --silent --accept-package-agreements --accept-source-agreements
 if %errorlevel%==0 (
-    echo [OK] winget 安装完成，等待 PATH 更新...
-    timeout /t 8 /nobreak >nul
-    :: 刷新 PATH 后再检测
-    where gs >nul 2>&1
-    if %errorlevel%==0 (
-        echo [验证] Ghostscript 就绪
-        goto :launch
+    echo [OK] winget 安装完成，正在扫描安装目录...
+    goto :find_gs_dirs
+)
+
+:: 方法2: 直接下载
+echo.
+echo [步骤2/2] winget 失败，下载安装包（约45MB）...
+echo [提示] 如果下载太慢，可以手动安装，网址见下方
+
+powershell -Command "[Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12; Invoke-WebRequest -Uri 'https://github.com/ArtifexSoftware/ghostpdl-downloads/releases/download/gs10070/gs10070w64.exe' -OutFile '%TEMP%\gs10070w64.exe' -TimeoutSec 300"
+
+if not exist "%TEMP%\gs10070w64.exe" (
+    echo.
+    echo [错误] 下载失败！
+    echo.
+    echo 请手动安装：
+    echo 打开浏览器访问以下链接，下载后双击安装：
+    echo https://github.com/ArtifexSoftware/ghostpdl-downloads/releases/tag/gs10070
+    pause
+    exit /b 1
+)
+
+echo [安装] 正在安装（约30秒）...
+"%TEMP%\gs10070w64.exe" /S
+del "%TEMP%\gs10070w64.exe" 2>nul
+
+:find_gs_dirs
+:: 扫描常见目录找 gswin*.exe
+set "FOUND_GS="
+for %%d in (
+    "C:\Program Files\gs"
+    "C:\Program Files\Ghostscript"
+) do (
+    if exist "%%d" (
+        for /f "delims=" %%f in ('dir /s /b "%%d\gswin*.exe" 2^>nul') do (
+            if not defined FOUND_GS (
+                set "FOUND_GS=%%f"
+            )
+        )
     )
-    echo [提示] winget 安装完成但检测未刷新，将检查安装目录...
-    if exist "C:\Program Files\gs\gs10.70\bin\gswin64c.exe" goto :launch
 )
 
-:: ===== 方法2: 直接下载 =====
-echo.
-echo [步骤2] 尝试直接下载安装包（约45MB）...
-echo [提示] 如果下载太慢，可以手动安装：https://ghostscript.com
-
-powershell -Command "[Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12; Invoke-WebRequest -Uri 'https://github.com/ArtifexSoftware/ghostpdl-downloads/releases/download/gs10070/gs10070w64.exe' -OutFile '%TEMP%\gs_install.exe'" 2>&1
-
-if not exist "%TEMP%\gs_install.exe" (
+if defined FOUND_GS (
+    echo [成功] Ghostscript 安装完成！
+    for %%f in ("!FOUND_GS!") do set "GS_BIN=%%~dpath"
+    set "PATH=!PATH;!GS_BIN!"
+    echo [路径] !GS_BIN!
+) else (
     echo.
-    echo [错误] 下载失败！可能原因：
-    echo   1. 网络连接问题
-    echo   2. 防火墙拦截
+    echo [警告] 未找到 Ghostscript 安装目录
+    echo 重启电脑后 PATH 会自动更新，届时正常运行
     echo.
-    echo   手动下载安装：
-    echo   打开浏览器访问以下链接，下载后双击安装：
-    echo   https://github.com/ArtifexSoftware/ghostpdl-downloads/releases/download/gs10070/gs10070w64.exe
-    echo.
-    echo 按回车键启动程序（压缩功能可能受限）...
-    pause >nul
-    goto :launch
+    echo 如果重启后仍无法使用，请手动安装：
+    echo https://ghostscript.com
 )
-
-echo [下载完成] 正在安装（请稍候，约30秒）...
-"%TEMP%\gs_install.exe" /S
-del "%TEMP%\gs_install.exe" 2>nul
-
-timeout /t 5 /nobreak >nul
-
-:: 验证
-where gs >nul 2>&1
-if %errorlevel%==0 (
-    echo [验证] Ghostscript 安装成功！
-    goto :launch
-)
-
-if exist "C:\Program Files\gs\gs10.70\bin\gswin64c.exe" (
-    echo [验证] Ghostscript 安装成功（安装目录）！
-    goto :launch
-)
-
-if exist "C:\Program Files\Ghostscript\gs10.70\bin\gswin64c.exe" (
-    echo [验证] Ghostscript 安装成功（Ghostscript目录）！
-    goto :launch
-)
-
-echo.
-echo [警告] 未能自动验证安装，但仍尝试启动程序...
-echo   如果启动后提示 Ghostscript 未找到，请重启电脑后重试。
-pause >nul
 
 :launch
 echo.
 echo [启动] 正在打开 PDF Shrinker...
 start "" "%~dp0PDFShrinker.exe"
+endlocal
 exit
