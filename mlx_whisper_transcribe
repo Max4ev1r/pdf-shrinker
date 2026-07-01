@@ -1,0 +1,28 @@
+#!/bin/bash
+# Hermes STT bridge: mlx-whisper → Hermes local_command interface
+# Hermes template: {input_path} {model} {language} {output_dir}
+
+INPUT="$1"
+MODEL="$2"        # e.g. "small" or "mlx-community/whisper-small"
+LANG="$3"
+OUTDIR="$4"
+
+# Strip mlx-community/whisper- prefix if present
+MODEL="${MODEL#mlx-community/whisper-}"
+
+VENV_PY="/Users/max/.hermes/hermes-agent/venv/bin/python3"
+AUDIO_DIR=$(dirname "$INPUT")
+AUDIO_STEM=$(basename "$INPUT" | sed 's/\.[^.]*$//')
+
+$VENV_PY -c "
+import sys
+sys.path.insert(0, '/Users/max/.hermes/hermes-agent/venv/lib/python3.11/site-packages')
+from mlx_whisper import transcribe
+from pathlib import Path
+
+result = transcribe('$INPUT', path_or_hf_repo='mlx-community/whisper-$MODEL', language='$LANG', verbose=False)
+text = result.get('text', '')
+out = Path('$OUTDIR') / '${AUDIO_STEM}.txt'
+out.write_text(text, encoding='utf-8')
+print(text)
+"
