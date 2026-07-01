@@ -18,7 +18,7 @@ import logging
 logging.basicConfig(level=logging.INFO, format='%(message)s')
 log = logging.getLogger(__name__)
 
-MAX_SIZE_MB = 5
+MAX_SIZE_MB = 10
 MAX_SIZE_BYTES = MAX_SIZE_MB * 1024 * 1024
 
 # 查找 gs 路径
