@@ -37,7 +37,7 @@ STATE_FILE = REPORT_DIR / "state.json"
 BACKUP_DIR = HERMES_HOME / "backups" / "controlled-learning"
 USER_FILE = HERMES_HOME / "memories" / "USER.md"
 AGENT_ROOT = HERMES_HOME / "hermes-agent"
-HERMES_PYTHON = AGENT_ROOT / "venv" / "bin" / "python"
+HERMES_PYTHON = AGENT_ROOT / ".venv" / "bin" / "python"
 
 DIRECT_USER_SOURCES = {
     "weixin",

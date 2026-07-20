@@ -38,7 +38,7 @@ STATE_FILE = REPORT_DIR / "state.json"
 KNOWN_ISSUES_FILE = REPORT_DIR / "known-issues.json"
 CRON_JOBS_FILE = HERMES_HOME / "cron" / "jobs.json"
 CONFIG_FILE = HERMES_HOME / "config.yaml"
-HERMES_PYTHON = HERMES_HOME / "hermes-agent" / "venv" / "bin" / "python"
+HERMES_PYTHON = HERMES_HOME / "hermes-agent" / ".venv" / "bin" / "python"
 EXPERT_PYTHON = HERMES_HOME / "mcp-servers" / "expert-tools" / ".venv" / "bin" / "python"
 ASTROLOGY_SMOKE_SCRIPT = (
     HERMES_HOME
@@ -48,6 +48,8 @@ ASTROLOGY_SMOKE_SCRIPT = (
     / "scripts"
     / "test_routing_regression.py"
 )
+QDRANT_GUARD_SCRIPT = SCRIPTS_DIR / "hermes_qdrant_guard.py"
+TELEGRAM_GUARD_SCRIPT = SCRIPTS_DIR / "hermes_telegram_guard.py"
 HINDSIGHT_LABEL = "ai.hermes.hindsight"
 HINDSIGHT_HEALTH_URL = "http://127.0.0.1:8100/health"
 
@@ -158,7 +160,7 @@ def fmt_size(num: int | None) -> str:
     return f"{num} B"
 
 
-def latest_file(path: Path, pattern: str = "*.md") -> Path | None:
+def latest_file(path: Path, pattern: str = "20*.md") -> Path | None:
     files = sorted(path.glob(pattern))
     return files[-1] if files else None
 
@@ -256,6 +258,142 @@ def check_hindsight(events: list[Event], *, dry_run: bool) -> None:
         )
 
 
+def run_qdrant_guard(mode: str) -> tuple[int, dict[str, Any], str]:
+    if not QDRANT_GUARD_SCRIPT.exists():
+        return 127, {}, f"{QDRANT_GUARD_SCRIPT} missing"
+    runner = HERMES_PYTHON if HERMES_PYTHON.exists() else Path(sys.executable)
+    flag = "--repair" if mode == "repair" else "--check"
+    code, output = run_command([str(runner), str(QDRANT_GUARD_SCRIPT), flag, "--json"], timeout=240)
+    try:
+        payload = json.loads(output)
+    except Exception:
+        payload = {}
+    return code, payload if isinstance(payload, dict) else {}, output
+
+
+def summarize_qdrant_guard(payload: dict[str, Any], fallback: str = "") -> str:
+    if not payload:
+        return fallback or "no guard payload"
+    url = payload.get("qdrant_url") or "unknown URL"
+    collection = payload.get("collection") or "unknown collection"
+    points = payload.get("points_count", 0)
+    errors = payload.get("errors") or []
+    actions = payload.get("actions") or []
+    detail = f"{url} collection={collection} points={points}"
+    if actions:
+        detail += f", actions={len(actions)}"
+    if errors:
+        detail += f", errors={errors}"
+    return detail
+
+
+def check_qdrant_memory_infra(events: list[Event], *, dry_run: bool) -> bool:
+    code, payload, output = run_qdrant_guard("check")
+    if code == 0 and payload.get("healthy"):
+        add(events, "ok", "memory-infra", "qdrant_healthy", summarize_qdrant_guard(payload))
+        return True
+
+    detail = summarize_qdrant_guard(payload, output)
+    if dry_run:
+        add(
+            events,
+            "action",
+            "memory-infra",
+            "would_repair_qdrant",
+            detail,
+            action=str(QDRANT_GUARD_SCRIPT),
+            notify=True,
+        )
+        return False
+
+    repair_code, repair_payload, repair_output = run_qdrant_guard("repair")
+    repair_detail = summarize_qdrant_guard(repair_payload, repair_output)
+    if repair_code == 0 and repair_payload.get("healthy"):
+        add(
+            events,
+            "action",
+            "memory-infra",
+            "qdrant_repaired",
+            f"Qdrant was unhealthy ({detail}); repair succeeded: {repair_detail}",
+            action=str(QDRANT_GUARD_SCRIPT),
+            notify=True,
+        )
+        return True
+
+    add(
+        events,
+        "critical",
+        "memory-infra",
+        "qdrant_unhealthy",
+        f"Qdrant is unhealthy and repair failed: {repair_detail}",
+        action=str(QDRANT_GUARD_SCRIPT),
+        notify=True,
+    )
+    return False
+
+
+def run_telegram_guard() -> tuple[int, dict[str, Any], str]:
+    if not TELEGRAM_GUARD_SCRIPT.exists():
+        return 127, {}, f"{TELEGRAM_GUARD_SCRIPT} missing"
+    runner = HERMES_PYTHON if HERMES_PYTHON.exists() else Path(sys.executable)
+    code, output = run_command([str(runner), str(TELEGRAM_GUARD_SCRIPT), "--check", "--json"], timeout=45)
+    try:
+        payload = json.loads(output)
+    except Exception:
+        payload = {}
+    return code, payload if isinstance(payload, dict) else {}, output
+
+
+def summarize_telegram_guard(payload: dict[str, Any], fallback: str = "") -> str:
+    if not payload:
+        return fallback or "no telegram guard payload"
+    status = payload.get("status", "unknown")
+    proxy = payload.get("proxy", {}) if isinstance(payload.get("proxy"), dict) else {}
+    get_me = payload.get("get_me", {}) if isinstance(payload.get("get_me"), dict) else {}
+    log = payload.get("gateway_log", {}) if isinstance(payload.get("gateway_log"), dict) else {}
+    parts = [
+        f"status={status}",
+        f"token_present={bool(payload.get('token_present'))}",
+    ]
+    if payload.get("proxy_url"):
+        parts.append(
+            f"proxy={proxy.get('host', '')}:{proxy.get('port', '')} reachable={proxy.get('reachable')}"
+        )
+    if get_me:
+        parts.append(f"getMe={get_me.get('ok')} status={get_me.get('status', 0)}")
+        if get_me.get("error"):
+            parts.append(f"error={get_me.get('error')}")
+    if log:
+        parts.append(
+            f"log_errors={log.get('error_count', 0)} log_success={log.get('success_count', 0)}"
+        )
+        if log.get("last_error_at"):
+            parts.append(f"last_error_at={log.get('last_error_at')}")
+    return ", ".join(parts)
+
+
+def check_telegram_gateway(events: list[Event]) -> None:
+    code, payload, output = run_telegram_guard()
+    detail = summarize_telegram_guard(payload, output)
+    status = str(payload.get("status", "unknown")) if payload else "guard_failed"
+    if code == 0 and status in {"healthy", "not_configured"}:
+        add(events, "ok", "gateway-telegram", f"telegram_{status}", detail)
+        return
+    if status == "flapping":
+        add(events, "warning", "gateway-telegram", "telegram_flapping", detail, notify=False)
+        return
+    if status == "proxy_down":
+        add(events, "critical", "gateway-telegram", "telegram_proxy_down", detail, notify=True)
+        return
+    if status == "token_missing":
+        add(events, "critical", "gateway-telegram", "telegram_token_missing", detail, notify=True)
+        return
+    if status == "api_unreachable":
+        add(events, "warning", "gateway-telegram", "telegram_api_unreachable", detail, notify=True)
+        return
+    add(events, "warning", "gateway-telegram", "telegram_guard_failed", detail, notify=True)
+
+
 def memory_provider() -> str:
     if not CONFIG_FILE.exists():
         return ""
@@ -285,6 +423,33 @@ def latest_shadow_holds_memory() -> tuple[bool, str]:
     text = latest.read_text(encoding="utf-8", errors="replace")
     holds = "Keep `memory.provider` unchanged" in text or "External memory backend: HOLD" in text
     return holds, str(latest)
+
+
+def latest_memory_audit_allows_provider(provider: str) -> tuple[bool, str, str]:
+    latest = latest_file(HERMES_HOME / "reports" / "memory-audit", pattern="20*.json")
+    if not latest:
+        return False, "", "no memory-audit JSON report found"
+    payload = read_json(latest, {})
+    mem0 = payload.get("mem0", {}) if isinstance(payload, dict) else {}
+    sync = payload.get("mem0_sync", {}) if isinstance(payload, dict) else {}
+    if provider == "vault":
+        if not (HERMES_HOME / "memory-vault" / "vault.sqlite3").exists():
+            return False, str(latest), "vault authority file is missing"
+        if mem0.get("active_memory_provider") != "vault":
+            return False, str(latest), "latest memory-audit did not observe vault as active provider"
+        database = payload.get("vault_database", {}) if isinstance(payload, dict) else {}
+        if not isinstance(database, dict) or not database.get("healthy"):
+            return False, str(latest), "vault database integrity, event chain, or index outbox is unhealthy"
+        return True, str(latest), "vault authority gate passed; derived index status is tracked separately"
+    if provider != "mem0":
+        return False, str(latest), f"provider {provider!r} is not approved by the memory-audit gate"
+    if mem0.get("active_memory_provider") != "mem0":
+        return False, str(latest), "latest memory-audit did not observe mem0 as active provider"
+    if not mem0.get("ready_for_production"):
+        return False, str(latest), "mem0 is not ready_for_production"
+    if sync.get("errors"):
+        return False, str(latest), "mem0 sync has errors"
+    return True, str(latest), "mem0 production gate passed"
 
 
 def blank_memory_provider(events: list[Event], *, dry_run: bool) -> None:
@@ -327,21 +492,42 @@ def blank_memory_provider(events: list[Event], *, dry_run: bool) -> None:
     )
 
 
-def check_memory_config(events: list[Event], *, dry_run: bool) -> None:
+def check_memory_config(events: list[Event], *, dry_run: bool, memory_infra_ok: bool = True) -> None:
     provider = memory_provider()
     if not provider:
         add(events, "ok", "memory", "built_in_only", "Production memory provider is built-in only.")
         return
+    if not memory_infra_ok and provider != "vault":
+        add(
+            events,
+            "critical",
+            "memory",
+            "provider_blocked_by_infra",
+            f"memory.provider is {provider!r}, but Qdrant/mem0 infrastructure is unhealthy. Leaving config unchanged.",
+            notify=True,
+        )
+        return
+    allowed, audit_path, detail = latest_memory_audit_allows_provider(provider)
+    if allowed:
+        add(events, "ok", "memory", "external_provider_approved", f"memory.provider is {provider!r}; {detail}: {audit_path}")
+        return
     holds, shadow = latest_shadow_holds_memory()
     if holds:
-        blank_memory_provider(events, dry_run=dry_run)
+        add(
+            events,
+            "warning",
+            "memory",
+            "provider_shadow_hold",
+            f"memory.provider remains {provider!r}; shadow validation is holding: {shadow}",
+            notify=True,
+        )
         return
     add(
         events,
         "critical",
         "memory",
         "external_provider_enabled",
-        f"memory.provider is {provider!r}, but no passing shadow approval was found. Latest shadow: {shadow or 'none'}",
+        f"memory.provider is {provider!r}, but no passing memory-audit approval was found ({detail}). Latest audit: {audit_path or 'none'}; latest shadow: {shadow or 'none'}",
         notify=True,
     )
 
@@ -506,7 +692,8 @@ def maybe_run_report_script(events: list[Event], report_subdir: str, script: str
         return
     before_path = latest
     before_mtime = latest.stat().st_mtime if latest else 0.0
-    code, output = run_command([str(script_path)], timeout=180)
+    runner = HERMES_PYTHON if HERMES_PYTHON.exists() else Path(sys.executable)
+    code, output = run_command([str(runner), str(script_path)], timeout=180)
     if code != 0:
         add(events, "critical", report_subdir, "regenerate_failed", f"{reason}; rc={code}; output={output}", notify=True)
         return
@@ -538,16 +725,68 @@ def maybe_run_report_script(events: list[Event], report_subdir: str, script: str
         report_subdir,
         "regenerated_verified",
         f"{reason}; generated {regenerated.name} and verified freshness.",
-        action=output or script,
-        notify=True,
+        action=script,
+        notify=False,
     )
 
 
 def check_reports(events: list[Event], *, dry_run: bool) -> None:
     maybe_run_report_script(events, "memory-shadow", "hindsight_shadow_check.py", dry_run=dry_run)
+    maybe_run_report_script(events, "memory-audit", "memory_vault.py", dry_run=dry_run)
+    maybe_run_report_script(events, "memory-retrieval", "memory_retrieval_eval.py", dry_run=dry_run)
+    maybe_run_report_script(events, "memory-governance", "memory_governor.py", dry_run=dry_run)
     maybe_run_report_script(events, "learning-review", "hermes_learning_review.py", dry_run=dry_run)
     maybe_run_report_script(events, "learning-actions", "hermes_learning_actions.py", dry_run=dry_run)
     maybe_run_report_script(events, "controlled-learning", "hermes_controlled_learning.py", dry_run=dry_run)
+
+
+def check_memory_governance_report(events: list[Event], state: dict[str, Any]) -> None:
+    latest = latest_file(HERMES_HOME / "reports" / "memory-governance", pattern="20*.json")
+    if not latest:
+        add(events, "warning", "memory-governance", "missing", "No memory-governance JSON report found.", notify=True)
+        return
+    payload = read_json(latest, {})
+    if not isinstance(payload, dict):
+        add(events, "warning", "memory-governance", "unreadable", f"Cannot parse {latest}.", notify=True)
+        return
+    errors = payload.get("errors", [])
+    if errors:
+        add(events, "critical", "memory-governance", "errors", f"{len(errors)} governance error(s) in {latest}.", notify=True)
+        return
+    review_count = len(payload.get("needs_user_review", []) or [])
+    merge_count = len(payload.get("merge_candidates", []) or [])
+    if review_count or merge_count:
+        candidate_ids = sorted(
+            str(item.get("id", ""))
+            for section in ("needs_user_review", "merge_candidates")
+            for item in (payload.get(section, []) or [])
+            if isinstance(item, dict) and item.get("id")
+        )
+        fingerprint = hashlib.sha256("\n".join(candidate_ids).encode("utf-8")).hexdigest()[:16]
+        review_state = state.setdefault("memory_governance_review", {})
+        previous = str(review_state.get("fingerprint", ""))
+        if not previous:
+            known = (state.get("known_issues", {}) or {}).get("memory-governance:pending_review", {})
+            if isinstance(known, dict) and known.get("state") == "active":
+                previous = fingerprint
+        changed = fingerprint != previous
+        review_state.update({
+            "fingerprint": fingerprint,
+            "candidate_ids": candidate_ids,
+            "count": review_count + merge_count,
+            "updated_at": now().isoformat(),
+        })
+        add(
+            events,
+            "warning" if changed else "info",
+            "memory-governance",
+            "pending_review" if changed else "pending_review_unchanged",
+            f"{review_count} high-risk/review candidate(s), {merge_count} merge candidate(s) need confirmation. See the local memory-governance report.",
+            notify=changed,
+        )
+        return
+    state.pop("memory_governance_review", None)
+    add(events, "ok", "memory-governance", "clean", f"Latest governance report is {latest.name}.")
 
 
 def prune_generated_reports(events: list[Event], *, dry_run: bool) -> None:
@@ -556,6 +795,9 @@ def prune_generated_reports(events: list[Event], *, dry_run: bool) -> None:
     total_bytes = 0
     roots = [
         HERMES_HOME / "reports" / "memory-shadow",
+        HERMES_HOME / "reports" / "memory-audit",
+        HERMES_HOME / "reports" / "memory-retrieval",
+        HERMES_HOME / "reports" / "memory-governance",
         HERMES_HOME / "reports" / "learning-review",
         HERMES_HOME / "reports" / "learning-actions",
         HERMES_HOME / "reports" / "controlled-learning",
@@ -719,6 +961,39 @@ def check_cron_jobs(events: list[Event], jobs: list[dict[str, Any]], state: dict
             failures.pop(job_id, None)
 
 
+def check_cron_prompt_memory_writes(events: list[Event], jobs: list[dict[str, Any]]) -> None:
+    """Flag scheduled prompts that ask the model to edit durable memory files."""
+    memory_file_re = re.compile(r"\b(?:MEMORY|USER|SOUL)\.md\b|~/.hermes/(?:memories|memory)/", re.IGNORECASE)
+    write_verb_re = re.compile(
+        r"追加|写入|编辑|修改|更新到|保存到|改写|append|write|edit|modify|update",
+        re.IGNORECASE,
+    )
+    explicit_safe_re = re.compile(r"不要直接编辑|不要自行写文件|只读|read[- ]?only", re.IGNORECASE)
+    risky: list[str] = []
+    for job in jobs:
+        if not job.get("enabled", True):
+            continue
+        prompt = str(job.get("prompt") or "")
+        if not prompt:
+            continue
+        if memory_file_re.search(prompt) and write_verb_re.search(prompt) and not explicit_safe_re.search(prompt):
+            risky.append(f"{job.get('name') or job.get('id')} ({job.get('id')})")
+
+    if risky:
+        add(
+            events,
+            "warning",
+            "cron-policy",
+            "direct_memory_write_prompt",
+            "Active cron prompt(s) ask the model to edit durable memory files directly: "
+            + "; ".join(risky[:5])
+            + ("; ..." if len(risky) > 5 else ""),
+            notify=True,
+        )
+    else:
+        add(events, "ok", "cron-policy", "no_direct_memory_write_prompts", "No active cron prompts directly edit durable memory files.")
+
+
 def check_capacity(events: list[Event]) -> None:
     disk = shutil.disk_usage(str(HERMES_HOME))
     free = disk.free
@@ -738,6 +1013,16 @@ def check_capacity(events: list[Event]) -> None:
 def issue_identity(event: Event) -> tuple[str, str]:
     if event.area == "hindsight" and event.status in {"restarted", "restart_failed", "would_restart"}:
         return "hindsight:unhealthy", "Restart Hindsight and verify /health reports healthy."
+    if event.area == "memory-infra" and event.status in {
+        "qdrant_repaired",
+        "qdrant_unhealthy",
+        "would_repair_qdrant",
+    }:
+        return "memory-infra:qdrant", "Start Colima/Docker, start the hermes-qdrant container, and verify Qdrant /healthz plus collection points."
+    if event.area == "gateway-telegram":
+        return "gateway-telegram:connectivity", "Verify TELEGRAM_BOT_TOKEN, local proxy reachability, Telegram getMe, and gateway reconnect logs before changing gateway behavior."
+    if event.area == "memory" and event.status == "provider_blocked_by_infra":
+        return "memory:external_provider_infra", "Repair Qdrant/mem0 infrastructure before changing memory.provider."
     if event.area == "memory" and event.status in {
         "provider_disabled",
         "external_provider_enabled",
@@ -779,6 +1064,7 @@ def update_known_issues(events: list[Event], state: dict[str, Any], cycle_id: st
             "would_restart",
             "would_regenerate",
             "would_disable_provider",
+            "would_repair_qdrant",
         }
         issues[key] = {
             "key": key,
@@ -868,7 +1154,7 @@ def notification_text(events: list[Event], md_path: Path) -> str:
         lines.append(f"- {event.area}/{event.status}: {event.message}")
     if len(notify_events) > 8:
         lines.append(f"- 还有 {len(notify_events) - 8} 项，见本地报告。")
-    lines.append(f"报告：{md_path}")
+    lines.append("详细报告已保存在本机 Hermes reports 目录。")
     return "\n".join(lines)
 
 
@@ -883,17 +1169,21 @@ def main() -> int:
     cycle_id = stamp()
 
     check_hindsight(events, dry_run=args.dry_run)
-    check_memory_config(events, dry_run=args.dry_run)
+    memory_infra_ok = check_qdrant_memory_infra(events, dry_run=args.dry_run)
+    check_telegram_gateway(events)
+    check_memory_config(events, dry_run=args.dry_run, memory_infra_ok=memory_infra_ok)
     enforce_controlled_write_gates(events, dry_run=args.dry_run)
     check_builtin_memory_capacity(events)
     check_astrology_semantics(events)
     check_capacity(events)
     check_reports(events, dry_run=args.dry_run)
+    check_memory_governance_report(events, state)
     prune_generated_reports(events, dry_run=args.dry_run)
 
     jobs = load_jobs()
     check_script_health(events, jobs)
     check_cron_jobs(events, jobs, state)
+    check_cron_prompt_memory_writes(events, jobs)
     update_known_issues(events, state, cycle_id)
     save_state(state)
     md_path, json_path = write_report(events, state)
