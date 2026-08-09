@@ -75,6 +75,11 @@ def write_json(path: Path, payload: Any) -> None:
 
 
 def candidate_is_auto_promotable(record: dict[str, Any]) -> bool:
+    source = record.get("source") if isinstance(record.get("source"), dict) else {}
+    if source.get("origin") == "controlled_learning":
+        # Controlled learning no longer owns user-facing durable memory.  Do
+        # not let an already-staged legacy candidate become active later.
+        return False
     return (
         record.get("status") == "pending"
         and record.get("risk") == "low"
@@ -116,31 +121,68 @@ def run_governance(*, dry_run: bool = False, no_sync: bool = False) -> dict[str,
     promoted_any = False
     for record in pending:
         record_id = record["id"]
+        effective_high_risk = vault.is_high_risk_memory(
+            str(record.get("body", "")),
+            str(record.get("topic", "other")),
+        )
         if record.get("governance_action") == "merge" or record.get("matched_id"):
             payload["merge_candidates"].append({
                 "id": record_id,
                 "matched_id": record.get("matched_id", ""),
                 "title": record.get("title", ""),
-                "risk": record.get("risk", ""),
+                "risk": "high" if effective_high_risk else record.get("risk", ""),
                 "reason": record.get("decision_reason", ""),
             })
             continue
-        if record.get("review_status") == "needs_user_review" or record.get("risk") == "high":
+        if (
+            effective_high_risk
+            or record.get("review_status") == "needs_user_review"
+            or record.get("risk") == "high"
+        ):
+            if (
+                effective_high_risk
+                and record.get("risk") != "high"
+                and not dry_run
+            ):
+                try:
+                    record = vault.reclassify_pending_risk(
+                        record_id,
+                        reason=(
+                            "current policy classifies this memory as "
+                            "sensitive"
+                        ),
+                    )
+                except SystemExit as exc:
+                    payload["errors"].append({
+                        "id": record_id,
+                        "stage": "risk_reclassification",
+                        "error": str(exc),
+                    })
+                    continue
             payload["needs_user_review"].append({
                 "id": record_id,
                 "title": record.get("title", ""),
                 "topic": record.get("topic", ""),
-                "risk": record.get("risk", ""),
-                "reason": record.get("decision_reason", ""),
+                "risk": "high",
+                "reason": (
+                    "current policy classifies this memory as sensitive"
+                    if effective_high_risk and record.get("risk") != "high"
+                    else record.get("decision_reason", "")
+                ),
             })
             continue
         if not candidate_is_auto_promotable(record):
+            source = record.get("source") if isinstance(record.get("source"), dict) else {}
             payload["needs_user_review"].append({
                 "id": record_id,
                 "title": record.get("title", ""),
                 "topic": record.get("topic", ""),
                 "risk": record.get("risk", ""),
-                "reason": "candidate does not satisfy low-risk auto-promotion rules",
+                "reason": (
+                    "controlled-learning candidates require an authoritative live turn"
+                    if source.get("origin") == "controlled_learning"
+                    else "candidate does not satisfy low-risk auto-promotion rules"
+                ),
             })
             continue
 

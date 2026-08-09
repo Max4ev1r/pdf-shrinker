@@ -51,6 +51,20 @@ PERSONAL_PREFERENCE_PATTERNS = [
     "不吃",
     "默认",
     "记住",
+    "我老婆叫",
+    "我老婆是",
+    "我丈夫",
+    "我老公",
+    "我儿子",
+    "我女儿",
+    "我宝宝",
+    "我住在",
+    "我的生日",
+    "生日是",
+    "不要再",
+    "以后都",
+    "以后给我",
+    "每次都",
 ]
 
 FOOD_PREFERENCE_TERMS = [
@@ -63,6 +77,21 @@ FOOD_PREFERENCE_TERMS = [
     "酸",
     "咸味",
     "椰子",
+]
+
+PERSONAL_FACT_TERMS = [
+    "老婆",
+    "妻子",
+    "丈夫",
+    "老公",
+    "儿子",
+    "女儿",
+    "宝宝",
+    "孩子",
+    "生日",
+    "出生",
+    "住在",
+    "偏好",
 ]
 
 PROCESS_RULE_PATTERNS = [
@@ -326,6 +355,17 @@ def is_personal_preference(text: str) -> bool:
     return False
 
 
+def is_personal_fact(text: str) -> bool:
+    return (
+        has_any(text, [*FOOD_PREFERENCE_TERMS, *PERSONAL_FACT_TERMS])
+        or has_any(text, PERSONAL_PREFERENCE_PATTERNS)
+        or bool(re.search(
+            r"(?:^|[，,。；;\s])我(?:的|家|现在|用|有|是|跟)",
+            text or "",
+        ))
+    )
+
+
 def is_process_rule(text: str) -> bool:
     return has_any(text, PROCESS_RULE_PATTERNS)
 
@@ -518,7 +558,7 @@ def classify_user_message(row: dict, repeated_process_themes: set[str]) -> Candi
             return make_candidate(
                 row,
                 status="manual_review",
-                target="USER.md candidate",
+                target="Vault candidate",
                 risk=risk,
                 score=5,
                 kind="high_risk_preference",
@@ -528,7 +568,7 @@ def classify_user_message(row: dict, repeated_process_themes: set[str]) -> Candi
         return make_candidate(
             row,
             status="stage_user_memory",
-            target="USER.md candidate",
+            target="Vault candidate",
             risk=risk,
             score=8,
             kind="personal_preference",
@@ -587,22 +627,27 @@ def classify_user_message(row: dict, repeated_process_themes: set[str]) -> Candi
             return make_candidate(
                 row,
                 status="manual_review",
-                target="skill or USER.md candidate",
+                target="skill or Vault candidate",
                 risk=risk,
                 score=5,
                 kind="high_risk_correction",
                 reason=f"correction intersects high-risk terms: {', '.join(risk_terms[:4])}",
                 text=clean,
             )
-        target = "USER.md candidate" if has_any(text, FOOD_PREFERENCE_TERMS) else "skill rule candidate"
+        is_personal = is_personal_fact(text)
+        target = "Vault update candidate" if is_personal else "skill rule candidate"
         return make_candidate(
             row,
-            status="stage_user_memory" if target.startswith("USER") else "stage_skill_rule",
+            status="manual_review" if is_personal else "stage_skill_rule",
             target=target,
             risk=risk,
             score=6,
-            kind="explicit_correction",
-            reason="explicit user correction",
+            kind="personal_correction" if is_personal else "explicit_correction",
+            reason=(
+                "personal correction requires the current memory and a complete replacement"
+                if is_personal
+                else "explicit user correction"
+            ),
             text=clean,
         )
 
@@ -786,8 +831,8 @@ def write_reports(
         "## Decision Gate",
         "",
         "- Next phase: Phase 3b controlled learning and verified self-heal.",
-        "- General/background auto-write to USER.md/MEMORY.md/skills: approval-gated.",
-        "- Controlled USER.md writes: handled separately with repetition, capacity, backup, and rollback gates.",
+        "- USER.md and MEMORY.md are not automatic long-term-memory targets.",
+        "- Low-risk recovered facts are staged in the local Vault and pass existing governance.",
         f"- External memory backend: {shadow_gate['action'].upper()} ({shadow_gate['reason']}).",
         f"- Latest memory-shadow report: {shadow_gate['file'] or 'none'}",
         "",
@@ -800,7 +845,7 @@ def write_reports(
         f"- Cron included: {include_cron}",
         f"- Noise included in report: {include_noise}",
         f"- Operational failure window: last {FAILURE_MAX_AGE_HOURS} hours",
-        f"- Stage USER.md candidates: {counts['stage_user_memory']}",
+        f"- Stage Vault candidates: {counts['stage_user_memory']}",
         f"- Stage skill-rule candidates: {counts['stage_skill_rule']}",
         f"- Manual review candidates: {counts['manual_review']}",
         f"- Failure signals to investigate: {counts['investigate_failure']}",
@@ -811,7 +856,7 @@ def write_reports(
     for item in candidates:
         by_status[item.status].append(item)
 
-    append_group(lines, "Stage For USER.md Review", by_status["stage_user_memory"], limit)
+    append_group(lines, "Stage For Vault Review", by_status["stage_user_memory"], limit)
     append_group(lines, "Stage As Skill Rules", by_status["stage_skill_rule"], limit)
     append_group(lines, "Manual Review Required", by_status["manual_review"], limit)
     append_group(lines, "Operational Failures To Investigate", by_status["investigate_failure"], limit)
@@ -824,7 +869,7 @@ def write_reports(
             "## Recommended Next Step",
             "",
             "- Keep Hindsight in shadow mode until semantic recall improves on real Max queries.",
-            "- Manually promote only the USER.md candidates that are stable personal facts.",
+            "- Manually promote only Vault candidates that are stable personal facts.",
             "- Convert repeated process rules into focused skills/tests before changing broad prompts.",
             "- Keep medical, medication, finance, legal, baby, and supplement items in manual review.",
             "",

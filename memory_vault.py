@@ -51,6 +51,7 @@ INDEX_PATH = VAULT_DIR / "index.json"
 OUTBOX_PATH = VAULT_DIR / "index-outbox.jsonl"
 OUTBOX_STATE_PATH = VAULT_DIR / "index-outbox-state.json"
 LOCAL_INDEX_PATH = VAULT_DIR / "local-search.sqlite3"
+LOCAL_EMBEDDING_CACHE = HERMES_HOME / "cache" / "fastembed"
 VAULT_DB_PATH = VAULT_DIR / "vault.sqlite3"
 VAULT_LOCK_PATH = VAULT_DIR / "vault.lock"
 README_PATH = VAULT_DIR / "README.md"
@@ -59,6 +60,40 @@ HERMES_AGENT_DIR = Path(
     os.environ.get("HERMES_AGENT_DIR", str(HERMES_HOME / "hermes-agent"))
 ).expanduser()
 HERMES_PYTHON = HERMES_AGENT_DIR / ".venv" / "bin" / "python"
+
+
+def configure_home(home: str | Path) -> None:
+    """Bind this isolated vault module to one durable storage home.
+
+    The Gateway multiplexes user profiles in one process.  Each provider gets
+    its own imported module, so rebinding these module globals keeps records,
+    SQLite, and the local index profile-scoped without mutating process-wide
+    environment variables.
+    """
+    global HERMES_HOME, MEMORIES_DIR, VAULT_DIR, TOPICS_DIR, REPORT_DIR
+    global GOVERNANCE_REPORT_DIR, RECORDS_PATH, HISTORY_PATH, INDEX_PATH
+    global OUTBOX_PATH, OUTBOX_STATE_PATH, LOCAL_INDEX_PATH
+    global LOCAL_EMBEDDING_CACHE, VAULT_DB_PATH, VAULT_LOCK_PATH
+    global README_PATH, MEM0_SEED_PATH, _LOCAL_EMBEDDER
+
+    HERMES_HOME = Path(home).expanduser()
+    MEMORIES_DIR = HERMES_HOME / "memories"
+    VAULT_DIR = HERMES_HOME / "memory-vault"
+    TOPICS_DIR = VAULT_DIR / "topics"
+    REPORT_DIR = HERMES_HOME / "reports" / "memory-audit"
+    GOVERNANCE_REPORT_DIR = HERMES_HOME / "reports" / "memory-governance"
+    RECORDS_PATH = VAULT_DIR / "memories.jsonl"
+    HISTORY_PATH = VAULT_DIR / "history.jsonl"
+    INDEX_PATH = VAULT_DIR / "index.json"
+    OUTBOX_PATH = VAULT_DIR / "index-outbox.jsonl"
+    OUTBOX_STATE_PATH = VAULT_DIR / "index-outbox-state.json"
+    LOCAL_INDEX_PATH = VAULT_DIR / "local-search.sqlite3"
+    LOCAL_EMBEDDING_CACHE = HERMES_HOME / "cache" / "fastembed"
+    VAULT_DB_PATH = VAULT_DIR / "vault.sqlite3"
+    VAULT_LOCK_PATH = VAULT_DIR / "vault.lock"
+    README_PATH = VAULT_DIR / "README.md"
+    MEM0_SEED_PATH = VAULT_DIR / "mem0_seed.jsonl"
+    _LOCAL_EMBEDDER = None
 
 ENTRY_DELIMITER = "\n§\n"
 SCHEMA_VERSION = 2
@@ -516,7 +551,10 @@ def get_local_embedder():
         if _LOCAL_EMBEDDER is None:
             from fastembed import TextEmbedding
 
-            _LOCAL_EMBEDDER = TextEmbedding(model_name=LOCAL_EMBEDDING_MODEL)
+            _LOCAL_EMBEDDER = TextEmbedding(
+                model_name=LOCAL_EMBEDDING_MODEL,
+                cache_dir=str(LOCAL_EMBEDDING_CACHE),
+            )
     return _LOCAL_EMBEDDER
 
 
@@ -590,6 +628,36 @@ def active_records_by_id() -> dict[str, dict[str, Any]]:
     return {r["id"]: r for r in read_jsonl(RECORDS_PATH) if r.get("status") == "active"}
 
 
+def resolve_active_successor(
+    records: list[dict[str, Any]],
+    record_id: str,
+) -> str:
+    """Follow a supersession chain to its single current active version."""
+    by_id = {str(record.get("id", "")): record for record in records}
+    current_id = str(record_id or "")
+    seen: set[str] = set()
+    while current_id:
+        if current_id in seen:
+            raise SystemExit(
+                f"Supersession cycle detected while resolving {record_id}"
+            )
+        seen.add(current_id)
+        current = by_id.get(current_id)
+        if current is None:
+            raise SystemExit(f"No record found for id {current_id}")
+        if current.get("status") == "active":
+            return current_id
+        if current.get("status") != "superseded":
+            raise SystemExit(f"Record {current_id} is not active")
+        successor_id = str(current.get("superseded_by", ""))
+        if not successor_id:
+            raise SystemExit(
+                f"Superseded record {current_id} has no successor"
+            )
+        current_id = successor_id
+    raise SystemExit("Merge requires an active memory id")
+
+
 def pending_records() -> list[dict[str, Any]]:
     ensure_layout()
     active = active_records_by_id()
@@ -612,6 +680,53 @@ def pending_records() -> list[dict[str, Any]]:
             "created_at": record.get("created_at", ""),
         })
     return sorted(rows, key=lambda row: (row["created_at"], row["id"]))
+
+
+@locked_mutation
+def reclassify_pending_risk(
+    record_id: str,
+    *,
+    reason: str,
+) -> dict[str, Any]:
+    records = read_jsonl(RECORDS_PATH)
+    record = next(
+        (
+            item
+            for item in records
+            if item.get("id") == record_id
+            and item.get("status") == "pending"
+        ),
+        None,
+    )
+    if record is None:
+        raise SystemExit(f"No pending record found for id {record_id}")
+    if not is_high_risk_memory(
+        str(record.get("body", "")),
+        str(record.get("topic", "other")),
+    ):
+        raise SystemExit(
+            f"Current policy does not classify {record_id} as high risk"
+        )
+    if (
+        record.get("risk") == "high"
+        and record.get("review_status") == "needs_user_review"
+    ):
+        return record
+    old = dict(record)
+    record["risk"] = "high"
+    record["review_status"] = "needs_user_review"
+    record["decision_reason"] = reason
+    record["updated_at"] = now_iso()
+    record_history(
+        "candidate_risk_reclassified",
+        record_id=record_id,
+        old=old,
+        new=dict(record),
+        reason=reason,
+        source="memory_governor.py",
+    )
+    save_records(records)
+    return record
 
 
 def review_record(candidate_id: str, decision: str, *, active_id: str = "", reason: str = "user review") -> dict[str, Any]:
@@ -1269,6 +1384,28 @@ def propose_record(
     for record in records:
         if record.get("status") in {"pending", "active"} and record.get("content_hash") == digest:
             if record.get("status") == "pending":
+                if (
+                    record.get("risk") != "high"
+                    and is_high_risk_memory(
+                        body,
+                        str(record.get("topic", "other")),
+                    )
+                ):
+                    old = dict(record)
+                    record["risk"] = "high"
+                    record["review_status"] = "needs_user_review"
+                    record["decision_reason"] = (
+                        "reclassified by current sensitive-memory policy"
+                    )
+                    record["updated_at"] = now_iso()
+                    record_history(
+                        "candidate_risk_reclassified",
+                        record_id=record["id"],
+                        old=old,
+                        new=dict(record),
+                        reason=record["decision_reason"],
+                        source=source,
+                    )
                 add_evidence(
                     record["id"], session_key=evidence_session or source,
                     content_digest=digest, source=source,
@@ -1362,6 +1499,8 @@ def propose_update(
     if active is None:
         raise SystemExit(f"No active record found for id {active_id}")
     digest = content_hash(body)
+    if active.get("content_hash") == digest:
+        return active, False
     for record in records:
         if record.get("status") == "pending" and record.get("content_hash") == digest and record.get("matched_id") == active_id:
             add_evidence(record["id"], session_key=evidence_session, content_digest=digest, source=source)
@@ -1423,6 +1562,7 @@ def promote_record(record_id: str, *, reason: str = "promote candidate") -> dict
         record.update({
             "status": "active",
             "review_status": "promoted",
+            "governance_action": "add",
             "updated_at": now_iso(),
         })
         record_history(
@@ -1472,6 +1612,7 @@ def merge_record(candidate_id: str, active_id: str, *, reason: str = "merge cand
     ensure_layout()
     records = read_jsonl(RECORDS_PATH)
     candidate = next((r for r in records if r.get("id") == candidate_id), None)
+    requested_active_id = active_id
     active = next((r for r in records if r.get("id") == active_id), None)
     if candidate is None:
         raise SystemExit(f"No candidate found for id {candidate_id}")
@@ -1480,7 +1621,8 @@ def merge_record(candidate_id: str, active_id: str, *, reason: str = "merge cand
     if candidate.get("status") != "pending":
         raise SystemExit(f"Record {candidate_id} is not pending")
     if active.get("status") != "active":
-        raise SystemExit(f"Record {active_id} is not active")
+        active_id = resolve_active_successor(records, active_id)
+        active = next(r for r in records if r.get("id") == active_id)
 
     old_candidate = dict(candidate)
     old_active = dict(active)
@@ -1490,27 +1632,36 @@ def merge_record(candidate_id: str, active_id: str, *, reason: str = "merge cand
         "updated_at": ts,
         "superseded_by": candidate_id,
     })
+    merged_source = {
+        **(candidate.get("source") if isinstance(candidate.get("source"), dict) else {}),
+        "kind": "merge",
+        "supersedes": active_id,
+    }
+    if requested_active_id != active_id:
+        merged_source["requested_supersedes"] = requested_active_id
     candidate.update({
         "status": "active",
         "review_status": "merged",
         "governance_action": "merge",
         "matched_id": active_id,
         "updated_at": ts,
-        "source": {
-            **(candidate.get("source") if isinstance(candidate.get("source"), dict) else {}),
-            "kind": "merge",
-            "supersedes": active_id,
-        },
+        "source": merged_source,
     })
+    history_extra = {
+        "records_before": [old_active, old_candidate],
+        "records_after": [dict(active), dict(candidate)],
+    }
+    if requested_active_id != active_id:
+        history_extra.update({
+            "requested_active_id": requested_active_id,
+            "resolved_active_id": active_id,
+        })
     record_history(
         "candidate_merged",
         record_id=candidate_id,
         reason=reason,
         source="memory_vault.py merge",
-        extra={
-            "records_before": [old_active, old_candidate],
-            "records_after": [dict(active), dict(candidate)],
-        },
+        extra=history_extra,
     )
     save_records(records)
     return candidate
@@ -1983,7 +2134,7 @@ def print_review() -> None:
 def main(argv: list[str] | None = None) -> int:
     ensure_hermes_runtime()
     if argv is None and len(sys.argv) == 1:
-        argv = ["observe"]
+        argv = ["audit"]
     parser = argparse.ArgumentParser(description="Manage Max's local Hermes memory vault.")
     sub = parser.add_subparsers(dest="cmd", required=True)
 

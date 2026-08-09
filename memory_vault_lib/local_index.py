@@ -14,6 +14,12 @@ from pathlib import Path
 from typing import Any, Callable, ContextManager, Sequence
 
 
+SEMANTIC_RELEVANCE_MIN = 0.58
+SEMANTIC_RELATIVE_MIN = 0.85
+HYBRID_SEMANTIC_MIN = 0.46
+HYBRID_LEXICAL_RATIO_MIN = 0.25
+
+
 class LocalSearchIndex:
     """Build and query a rebuildable index without owning authoritative data."""
 
@@ -323,9 +329,62 @@ class LocalSearchIndex:
             )
         scores: dict[str, float] = {}
         by_id: dict[str, dict[str, Any]] = {}
+        lexical_by_id = {
+            str(record["id"]): record
+            for record in lexical
+        }
+        semantic_by_id = {
+            str(record["id"]): record
+            for record in semantic
+        }
+        best_lexical_strength = max(
+            (
+                abs(float(record.get("rank", 0.0)))
+                for record in lexical
+            ),
+            default=0.0,
+        )
+        best_semantic_score = max(
+            (
+                float(record.get("semantic_score", 0.0))
+                for record in semantic
+            ),
+            default=0.0,
+        )
         for weight, rows in ((1.25, lexical), (1.0, semantic)):
             for rank, record in enumerate(rows, 1):
                 record_id = str(record["id"])
+                semantic_score = float(
+                    semantic_by_id.get(record_id, {}).get(
+                        "semantic_score",
+                        0.0,
+                    )
+                )
+                lexical_strength = abs(float(
+                    lexical_by_id.get(record_id, {}).get("rank", 0.0)
+                ))
+                strong_semantic = (
+                    semantic_score >= SEMANTIC_RELEVANCE_MIN
+                    and best_semantic_score > 0
+                    and semantic_score / best_semantic_score
+                    >= SEMANTIC_RELATIVE_MIN
+                )
+                corroborated = (
+                    record_id in lexical_by_id
+                    and record_id in semantic_by_id
+                    and semantic_score >= HYBRID_SEMANTIC_MIN
+                    and best_lexical_strength > 0
+                    and lexical_strength / best_lexical_strength
+                    >= HYBRID_LEXICAL_RATIO_MIN
+                )
+                # Local embeddings are optional.  When the embedding backend
+                # is unavailable, an exact/keyword FTS hit is still durable
+                # evidence and must not be discarded solely because no vector
+                # row can corroborate it.  Keep the stricter hybrid gate when
+                # semantic candidates are present.
+                lexical_only = not semantic and record_id in lexical_by_id
+                if not (strong_semantic or corroborated or lexical_only):
+                    continue
                 scores[record_id] = (
                     scores.get(record_id, 0.0) + weight / (60 + rank)
                 )

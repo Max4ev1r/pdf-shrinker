@@ -9,14 +9,13 @@ from typing import Any, Callable
 
 DEFAULT_HIGH_RISK_TOPICS = {
     "health",
-    "family",
     "company_finance",
-    "profile",
 }
 DEFAULT_HIGH_RISK_PATTERNS = (
     "高血压", "用药", "替尔泊肽", "体检", "护肤", "BMI", "宝宝", "家人",
-    "公司", "财税", "社保", "股权", "黄金", "身份证", "密码", "token",
-    "secret", "api key", "令牌", "密钥", "银行卡",
+    "公司", "财税", "社保", "股权", "黄金", "持仓", "股票", "基金", "证券",
+    "券商", "买入价", "成交额", "资产", "收入", "工资", "贷款", "债务", "余额",
+    "身份证", "密码", "token", "secret", "api key", "令牌", "密钥", "银行卡",
 )
 SECRET_PATTERNS = (
     re.compile(

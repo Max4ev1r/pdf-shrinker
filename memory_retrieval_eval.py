@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Evaluate production vault retrieval through Qdrant and its local fallback."""
+"""Evaluate precision and recall of the production local Vault retrieval path."""
 
 from __future__ import annotations
 
@@ -7,6 +7,7 @@ import datetime as dt
 import importlib
 import json
 import os
+import sqlite3
 import sys
 import time
 from pathlib import Path
@@ -25,21 +26,29 @@ CASES = [
         "name": "communication_preference",
         "query": "Max 的沟通偏好 唯一推荐 明确理由 修复深度验证",
         "expected_any": ["mem_4ee64e7f15dd", "mem_aa58b07e80f1"],
+        "allowed_ids": [
+            "mem_4ee64e7f15dd", "mem_aa58b07e80f1",
+            "mem_4d24f96563b4", "mem_0b15485647b1",
+            "mem_af0f930195fc",
+        ],
     },
     {
         "name": "home_assistant_air_conditioner",
         "query": "Home Assistant 空调控制脚本 token ha_control.py ha_set_temp.py",
         "expected_any": ["mem_f4eb5d1a11a4", "mem_4c726563db61"],
+        "allowed_ids": ["mem_f4eb5d1a11a4", "mem_4c726563db61"],
     },
     {
         "name": "skincare_plan",
         "query": "Max 当前护肤方案 CeraVe 阿达帕林 壬二酸 屏障修复",
         "expected_any": ["mem_5015bc9d66b2"],
+        "allowed_ids": ["mem_5015bc9d66b2"],
     },
     {
         "name": "apple_music_windows_bug",
         "query": "Apple Music Windows 无损音质 设置 重置 AAC 256kbps bug",
         "expected_any": ["mem_8c391efcdc4c"],
+        "allowed_ids": ["mem_8c391efcdc4c"],
     },
     {
         "name": "natural_direct_answer_preference",
@@ -48,21 +57,30 @@ CASES = [
             "mem_4ee64e7f15dd", "mem_aa58b07e80f1",
             "mem_4b1ded36995b", "mem_af0f930195fc",
         ],
+        "allowed_ids": [
+            "mem_4ee64e7f15dd", "mem_aa58b07e80f1",
+            "mem_4b1ded36995b", "mem_af0f930195fc",
+            "mem_4d24f96563b4", "mem_0b15485647b1",
+            "mem_7168b61cab3b",
+        ],
     },
     {
         "name": "natural_home_temperature_control",
         "query": "家里的冷气要通过哪个脚本调温？",
         "expected_any": ["mem_f4eb5d1a11a4", "mem_4c726563db61"],
+        "allowed_ids": ["mem_f4eb5d1a11a4", "mem_4c726563db61"],
     },
     {
         "name": "natural_skin_barrier",
         "query": "脸上所有东西都有点刺，最近早晚该怎么护理？",
         "expected_any": ["mem_5015bc9d66b2"],
+        "allowed_ids": ["mem_5015bc9d66b2"],
     },
     {
         "name": "natural_music_quality_reset",
         "query": "为什么电脑上的苹果音乐每次重开都变回普通音质？",
         "expected_any": ["mem_8c391efcdc4c"],
+        "allowed_ids": ["mem_8c391efcdc4c"],
     },
     {
         "name": "natural_product_rules",
@@ -71,6 +89,53 @@ CASES = [
             "mem_7168b61cab3b", "mem_4b1ded36995b",
             "mem_3b11712b2b2e", "mem_7e6f360a6db1",
         ],
+        "allowed_ids": [
+            "mem_7168b61cab3b", "mem_4b1ded36995b",
+            "mem_3b11712b2b2e", "mem_7e6f360a6db1",
+            "mem_f61b63101c55",
+        ],
+    },
+    {
+        "name": "negative_greeting",
+        "query": "你好，今天怎么样？",
+        "expected_any": [],
+        "allowed_ids": [],
+        "expect_empty": True,
+    },
+    {
+        "name": "negative_weather",
+        "query": "无锡今天会下雨吗？",
+        "expected_any": [],
+        "allowed_ids": [],
+        "expect_empty": True,
+    },
+    {
+        "name": "negative_arithmetic",
+        "query": "帮我算一下 37 乘以 19",
+        "expected_any": [],
+        "allowed_ids": [],
+        "expect_empty": True,
+    },
+    {
+        "name": "negative_programming",
+        "query": "解释一下 Python 的 async await",
+        "expected_any": [],
+        "allowed_ids": [],
+        "expect_empty": True,
+    },
+    {
+        "name": "negative_translation",
+        "query": "把 good morning 翻译成中文",
+        "expected_any": [],
+        "allowed_ids": [],
+        "expect_empty": True,
+    },
+    {
+        "name": "negative_one_off_task",
+        "query": "帮我把下面这句话改得更通顺",
+        "expected_any": [],
+        "allowed_ids": [],
+        "expect_empty": True,
     },
 ]
 
@@ -115,16 +180,11 @@ def parse_tool_json(raw: str) -> dict[str, Any]:
     return payload if isinstance(payload, dict) else {"result": payload}
 
 
-def is_qdrant_lock_error(message: str) -> bool:
-    lowered = str(message or "").lower()
-    return "already accessed by another instance of qdrant client" in lowered
-
-
 def evaluate_case(
     provider,
     case: dict[str, Any],
     *,
-    required_mode: str,
+    accepted_modes: set[str],
 ) -> dict[str, Any]:
     started = time.monotonic()
     payload = parse_tool_json(provider.handle_tool_call(
@@ -135,31 +195,95 @@ def evaluate_case(
     results = payload.get("results", []) if isinstance(payload.get("results"), list) else []
     memories = [str(item.get("id", "")) for item in results]
     expected_any = list(case["expected_any"])
+    allowed_ids = set(case.get("allowed_ids", expected_any))
     matched = [marker for marker in expected_any if marker in memories]
     actual_mode = str(payload.get("mode", "unknown"))
-    content_passed = bool(matched)
-    mode_passed = actual_mode == required_mode
+    expect_empty = bool(case.get("expect_empty"))
+    content_passed = not memories if expect_empty else bool(matched)
+    precision_passed = all(memory_id in allowed_ids for memory_id in memories)
+    mode_passed = actual_mode in accepted_modes
+    error = payload.get("error") or payload.get("degraded_reason", "")
     return {
         "name": case["name"],
         "query": case["query"],
         "expected_any": expected_any,
         "matched": matched,
-        "passed": content_passed and mode_passed,
+        "passed": (
+            content_passed
+            and precision_passed
+            and mode_passed
+            and not error
+        ),
         "content_passed": content_passed,
+        "precision_passed": precision_passed,
         "mode_passed": mode_passed,
         "mode": actual_mode,
-        "required_mode": required_mode,
+        "accepted_modes": sorted(accepted_modes),
+        "expect_empty": expect_empty,
+        "allowed_ids": sorted(allowed_ids),
         "elapsed_ms": elapsed_ms,
-        "error": payload.get("error") or payload.get("degraded_reason", ""),
+        "error": error,
         "top_results": [
             {
                 "id": item.get("id", ""),
                 "score": item.get("score", 0),
                 "memory": str(item.get("summary", ""))[:500],
             }
-            for item in results[:5]
+            for item in results[:3]
         ],
     }
+
+
+def evaluate_backends(provider) -> list[dict[str, Any]]:
+    checks: list[dict[str, Any]] = []
+    try:
+        vector = next(iter(
+            provider._vault.get_local_embedder().query_embed(
+                ["Hermes 本地长期记忆向量检索健康检查"]
+            )
+        ))
+        dimensions = len(vector)
+        checks.append({
+            "name": "local_vector",
+            "passed": dimensions > 0,
+            "dimensions": dimensions,
+            "error": "",
+        })
+    except Exception as exc:
+        checks.append({
+            "name": "local_vector",
+            "passed": False,
+            "dimensions": 0,
+            "error": f"{type(exc).__name__}: {exc}",
+        })
+
+    try:
+        records = provider._vault.read_jsonl(provider._vault.RECORDS_PATH)
+        provider._vault.ensure_local_index(records)
+        with sqlite3.connect(provider._vault.LOCAL_INDEX_PATH) as conn:
+            integrity = conn.execute("PRAGMA integrity_check").fetchone()[0]
+            metadata = dict(
+                conn.execute("SELECT key,value FROM index_meta").fetchall()
+            )
+        checks.append({
+            "name": "local_index",
+            "passed": (
+                integrity == "ok"
+                and metadata.get("embedding_status") == "ready"
+            ),
+            "integrity": integrity,
+            "embedding_status": metadata.get("embedding_status", ""),
+            "error": "",
+        })
+    except Exception as exc:
+        checks.append({
+            "name": "local_index",
+            "passed": False,
+            "integrity": "unknown",
+            "embedding_status": "unknown",
+            "error": f"{type(exc).__name__}: {exc}",
+        })
+    return checks
 
 
 def write_report(payload: dict[str, Any]) -> None:
@@ -167,6 +291,8 @@ def write_report(payload: dict[str, Any]) -> None:
     stamp = now_stamp()
     json_path = REPORT_DIR / f"{stamp}.json"
     md_path = REPORT_DIR / f"{stamp}.md"
+    payload["report_json"] = str(json_path)
+    payload["report_md"] = str(md_path)
     json_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True) + "\n", encoding="utf-8")
     lines = [
         "# Memory Retrieval Eval",
@@ -174,8 +300,26 @@ def write_report(payload: dict[str, Any]) -> None:
         f"- generated_at: `{payload['generated_at']}`",
         f"- passed: `{payload['passed']}`",
         f"- cases: `{payload['passed_count']}/{payload['case_count']}`",
+        f"- backends: `{payload['backend_passed_count']}/{payload['backend_count']}`",
+        f"- warm p95: `{payload['latency_p95_ms']}ms` (limit `{payload['latency_limit_ms']}ms`)",
+        "",
+        "## Backend Checks",
         "",
     ]
+    for check in payload["backend_checks"]:
+        status = "PASS" if check["passed"] else "FAIL"
+        detail = (
+            f"dimensions={check['dimensions']}"
+            if "dimensions" in check
+            else (
+                f"integrity={check['integrity']} "
+                f"embedding={check['embedding_status']}"
+            )
+        )
+        lines.append(f"- `{status}` `{check['name']}` {detail}")
+        if check.get("error"):
+            lines.append(f"  - error: `{check['error']}`")
+    lines.append("")
     for case in payload["cases"]:
         status = "PASS" if case["passed"] else "FAIL"
         lines.extend([
@@ -183,9 +327,11 @@ def write_report(payload: dict[str, Any]) -> None:
             "",
             f"- status: `{status}`",
             f"- elapsed_ms: `{case['elapsed_ms']}`",
-            f"- mode: `{case['mode']}` (required `{case['required_mode']}`)",
+            f"- mode: `{case['mode']}` (accepted `{', '.join(case['accepted_modes'])}`)",
             f"- matched: `{', '.join(case['matched']) or 'none'}`",
             f"- expected_any: `{', '.join(case['expected_any'])}`",
+            f"- precision_passed: `{case['precision_passed']}`",
+            f"- allowed_ids: `{', '.join(case['allowed_ids']) or 'none'}`",
             f"- query: `{case['query']}`",
             "",
         ])
@@ -196,22 +342,16 @@ def write_report(payload: dict[str, Any]) -> None:
             lines.append(f"{idx}. `{result['id']}` score=`{result['score']}` {memory}")
         lines.append("")
     md_path.write_text("\n".join(lines).rstrip() + "\n", encoding="utf-8")
-    payload["report_json"] = str(json_path)
-    payload["report_md"] = str(md_path)
 
 
 def main() -> int:
     ensure_hermes_runtime()
-    local_only = "--local-only" in sys.argv
-    if local_only:
-        sys.argv.remove("--local-only")
     provider = load_provider()
     try:
-        if local_only:
-            provider._semantic_search = lambda query, top_k: []  # type: ignore[attr-defined]
-        required_mode = "local-hybrid" if local_only else "hybrid"
+        backend_checks = evaluate_backends(provider)
+        accepted_modes = {"local-hybrid"}
         cases = [
-            evaluate_case(provider, case, required_mode=required_mode)
+            evaluate_case(provider, case, accepted_modes=accepted_modes)
             for case in CASES
         ]
     finally:
@@ -220,16 +360,44 @@ def main() -> int:
         except Exception:
             pass
     passed_count = sum(1 for case in cases if case["passed"])
+    backend_passed_count = sum(1 for check in backend_checks if check["passed"])
+    elapsed = sorted(case["elapsed_ms"] for case in cases)
+    p95_index = max(0, (95 * len(elapsed) + 99) // 100 - 1)
+    latency_p95_ms = elapsed[p95_index] if elapsed else 0
+    latency_limit_ms = 50
     payload = {
         "generated_at": dt.datetime.now().astimezone().isoformat(timespec="seconds"),
-        "passed": passed_count == len(cases),
+        "passed": (
+            passed_count == len(cases)
+            and backend_passed_count == len(backend_checks)
+            and latency_p95_ms <= latency_limit_ms
+        ),
         "case_count": len(cases),
         "passed_count": passed_count,
-        "mode": "local-hybrid" if local_only else "production-hybrid",
+        "backend_count": len(backend_checks),
+        "backend_passed_count": backend_passed_count,
+        "backend_checks": backend_checks,
+        "latency_p95_ms": latency_p95_ms,
+        "latency_limit_ms": latency_limit_ms,
+        "mode": "production-local-hybrid",
         "cases": cases,
     }
     write_report(payload)
-    print(json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True))
+    print(json.dumps({
+        "passed": payload["passed"],
+        "cases": f"{passed_count}/{len(cases)}",
+        "backends": f"{backend_passed_count}/{len(backend_checks)}",
+        "failed_cases": [
+            case["name"] for case in cases if not case["passed"]
+        ],
+        "failed_backends": [
+            check["name"] for check in backend_checks if not check["passed"]
+        ],
+        "latency_p95_ms": latency_p95_ms,
+        "latency_limit_ms": latency_limit_ms,
+        "report_json": payload["report_json"],
+        "report_md": payload["report_md"],
+    }, ensure_ascii=False, indent=2, sort_keys=True))
     return 0 if payload["passed"] else 1
 
 

@@ -7,8 +7,8 @@ This script turns the shadow/review/action reports into an operational loop:
 - keep durable reports for auditing
 - stay silent when nothing needs attention
 
-It intentionally does not write USER.md, MEMORY.md, SOUL.md, skills, medical
-facts, product conclusions, or user preference memory.
+It never writes USER.md, MEMORY.md, SOUL.md, skills, or inferred user facts.
+Its controlled-learning child may stage direct-user facts in Vault governance.
 """
 
 from __future__ import annotations
@@ -789,6 +789,66 @@ def check_memory_governance_report(events: list[Event], state: dict[str, Any]) -
     add(events, "ok", "memory-governance", "clean", f"Latest governance report is {latest.name}.")
 
 
+def check_controlled_learning_report(events: list[Event]) -> None:
+    latest = latest_file(
+        HERMES_HOME / "reports" / "controlled-learning",
+        pattern="20*.json",
+    )
+    if not latest:
+        add(
+            events,
+            "warning",
+            "controlled-learning",
+            "missing",
+            "No controlled-learning JSON report found.",
+            notify=True,
+        )
+        return
+    payload = read_json(latest, {})
+    if not isinstance(payload, dict):
+        add(
+            events,
+            "critical",
+            "controlled-learning",
+            "unreadable",
+            f"Cannot parse {latest}.",
+            notify=True,
+        )
+        return
+    if payload.get("target") != "vault":
+        add(
+            events,
+            "critical",
+            "controlled-learning",
+            "wrong_target",
+            f"Latest controlled-learning report does not target Vault: {latest}.",
+            notify=True,
+        )
+        return
+    errors = [
+        decision
+        for decision in payload.get("decisions", [])
+        if isinstance(decision, dict) and decision.get("outcome") == "error"
+    ]
+    if errors:
+        add(
+            events,
+            "critical",
+            "controlled-learning",
+            "staging_failed",
+            f"{len(errors)} Vault staging error(s) in {latest}.",
+            notify=True,
+        )
+        return
+    add(
+        events,
+        "ok",
+        "controlled-learning",
+        "vault_target_verified",
+        f"Latest controlled-learning report targets Vault: {latest.name}.",
+    )
+
+
 def prune_generated_reports(events: list[Event], *, dry_run: bool) -> None:
     cutoff = time.time() - REPORT_KEEP_DAYS * 86400
     total_deleted = 0
@@ -1169,7 +1229,20 @@ def main() -> int:
     cycle_id = stamp()
 
     check_hindsight(events, dry_run=args.dry_run)
-    memory_infra_ok = check_qdrant_memory_infra(events, dry_run=args.dry_run)
+    if memory_provider() == "vault":
+        memory_infra_ok = True
+        add(
+            events,
+            "ok",
+            "memory-infra",
+            "vault_local_authority",
+            "Vault uses its local SQLite/vector index; Qdrant is not a production dependency.",
+        )
+    else:
+        memory_infra_ok = check_qdrant_memory_infra(
+            events,
+            dry_run=args.dry_run,
+        )
     check_telegram_gateway(events)
     check_memory_config(events, dry_run=args.dry_run, memory_infra_ok=memory_infra_ok)
     enforce_controlled_write_gates(events, dry_run=args.dry_run)
@@ -1178,6 +1251,7 @@ def main() -> int:
     check_capacity(events)
     check_reports(events, dry_run=args.dry_run)
     check_memory_governance_report(events, state)
+    check_controlled_learning_report(events)
     prune_generated_reports(events, dry_run=args.dry_run)
 
     jobs = load_jobs()
@@ -1185,7 +1259,8 @@ def main() -> int:
     check_cron_jobs(events, jobs, state)
     check_cron_prompt_memory_writes(events, jobs)
     update_known_issues(events, state, cycle_id)
-    save_state(state)
+    if not args.dry_run:
+        save_state(state)
     md_path, json_path = write_report(events, state)
 
     note = notification_text(events, md_path)

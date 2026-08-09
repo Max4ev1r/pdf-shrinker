@@ -1,43 +1,28 @@
 #!/usr/bin/env python3
-"""Apply narrowly scoped, reversible Hermes learning updates.
-
-Phase 3b policy:
-- consume the latest filtered learning-action report
-- auto-apply only repeated, low-risk, direct-user preference facts
-- use Hermes' native MemoryStore for locking, scanning, and capacity checks
-- back up and verify every write; restore the backup if verification fails
-- queue ambiguous or high-risk candidates without modifying memory
-
-This script never writes MEMORY.md, skills, config, or an external memory
-provider. Its only writable knowledge target is memories/USER.md.
-"""
+"""Review missed durable user facts without bypassing the live Vault owner."""
 
 from __future__ import annotations
 
 import argparse
 import datetime as dt
 import hashlib
+import importlib.util
 import json
 import os
 import re
-import shutil
 import sys
 from collections import defaultdict
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any
 
-import yaml
-
-
 HERMES_HOME = Path(os.environ.get("HERMES_HOME", str(Path.home() / ".hermes"))).expanduser()
 ACTION_DIR = HERMES_HOME / "reports" / "learning-actions"
 REPORT_DIR = HERMES_HOME / "reports" / "controlled-learning"
 STATE_FILE = REPORT_DIR / "state.json"
-BACKUP_DIR = HERMES_HOME / "backups" / "controlled-learning"
-USER_FILE = HERMES_HOME / "memories" / "USER.md"
 AGENT_ROOT = HERMES_HOME / "hermes-agent"
 HERMES_PYTHON = AGENT_ROOT / ".venv" / "bin" / "python"
+VAULT_SCRIPT = HERMES_HOME / "scripts" / "memory_vault.py"
 
 DIRECT_USER_SOURCES = {
     "weixin",
@@ -53,7 +38,6 @@ DIRECT_USER_SOURCES = {
     "web",
 }
 
-AUTO_MIN_SUPPORT = 2
 QUEUE_KEEP_DAYS = 30
 
 
@@ -111,87 +95,92 @@ def safe_item(raw: str) -> str:
     return item[:16]
 
 
-def extract_preference_facts(text: str) -> list[tuple[str, str]]:
-    """Extract only simple food dislikes; broader preferences remain queued."""
+def extract_durable_facts(text: str) -> list[tuple[str, str]]:
+    """Reduce only high-confidence direct-user statements to durable facts."""
     clean = re.sub(r"\s+", " ", text or "").strip()
+    if not clean:
+        return []
     found: dict[str, str] = {}
-    patterns = [
+
+    explicit = re.match(
+        r"^(?:(?:请|麻烦|帮我|你)\s*)?(?:长期)?"
+        r"(?:记住|记一下|记下来)(?:这件事|这个|以下内容)?"
+        r"\s*[：:，,\s]+(.+)$",
+        clean,
+        flags=re.DOTALL,
+    )
+    if explicit:
+        content = explicit.group(1).strip()
+        if 2 <= len(content) <= 1200:
+            key = "explicit:" + hashlib.sha1(
+                compact(content).encode("utf-8")
+            ).hexdigest()[:16]
+            found[key] = content
+
+    food_patterns = [
         r"(?:我)?不喜欢吃(?P<item>[\u4e00-\u9fffA-Za-z0-9·\-]{1,16}?)(?=最喜欢|也喜欢|还可以|$|[，。；、\s])",
         r"(?<!喜)不吃(?P<item>[\u4e00-\u9fffA-Za-z0-9·\-]{1,16}?)(?=最喜欢|也喜欢|还可以|$|[，。；、\s])",
     ]
-    for pattern in patterns:
+    for pattern in food_patterns:
         for match in re.finditer(pattern, clean):
             item = safe_item(match.group("item"))
             if not item:
                 continue
             key = f"food_dislike:{compact(item)}"
             found[key] = f"饮食偏好：不喜欢吃{item}。"
+
+    spouse = re.search(
+        r"(?:我)?(?:老婆|妻子|丈夫|老公)(?:叫|是)"
+        r"(?P<name>[\u4e00-\u9fff]{2,6})(?=$|[，。；、\s])",
+        clean,
+    )
+    if spouse:
+        name = spouse.group("name")
+        found[f"family:spouse:{compact(name)}"] = f"配偶：{name}。"
+
+    birthday = re.search(
+        r"(?:我的)?生日(?:是|为)?\s*"
+        r"(?P<date>\d{4}[-年/]\d{1,2}[-月/]\d{1,2}[日号]?)",
+        clean,
+    )
+    if birthday:
+        date = birthday.group("date")
+        found[f"birthday:{compact(date)}"] = f"生日：{date}。"
+
+    if re.match(
+        r"^(?:我(?:一直|长期)?(?:喜欢|不喜欢|偏好)|"
+        r"以后|今后|默认|每次|始终)",
+        clean,
+    ) and len(clean) <= 240:
+        key = "preference:" + hashlib.sha1(
+            compact(clean).encode("utf-8")
+        ).hexdigest()[:16]
+        found[key] = clean
+
     return sorted(found.items())
 
 
-def existing_fact(user_text: str, fact: Fact) -> bool:
-    if fact.key.startswith("food_dislike:"):
-        item = fact.key.split(":", 1)[1]
-        existing = compact(user_text)
-        return f"不喜欢吃{item}" in existing or f"不吃{item}" in existing
-    return compact(fact.content) in compact(user_text)
+def load_memory_vault():
+    spec = importlib.util.spec_from_file_location(
+        "_hermes_controlled_learning_vault",
+        VAULT_SCRIPT,
+    )
+    if spec is None or spec.loader is None:
+        raise RuntimeError(f"Cannot load {VAULT_SCRIPT}")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
 
 
-def memory_limits() -> tuple[int, int]:
-    config = yaml.safe_load((HERMES_HOME / "config.yaml").read_text(encoding="utf-8")) or {}
-    memory = config.get("memory") or {}
-    return int(memory.get("memory_char_limit", 2200)), int(memory.get("user_char_limit", 1375))
-
-
-def load_memory_store():
-    sys.path.insert(0, str(AGENT_ROOT))
-    from tools.memory_tool import MemoryStore
-
-    memory_limit, user_limit = memory_limits()
-    store = MemoryStore(memory_char_limit=memory_limit, user_char_limit=user_limit)
-    store.load_from_disk()
-    return store
-
-
-def backup_user_file() -> Path:
-    BACKUP_DIR.mkdir(parents=True, exist_ok=True)
-    backup = BACKUP_DIR / f"USER-{stamp()}.md.bak"
-    if USER_FILE.exists():
-        shutil.copy2(USER_FILE, backup)
-    else:
-        backup.write_text("", encoding="utf-8")
-    return backup
-
-
-def restore_user_file(backup: Path) -> None:
-    USER_FILE.parent.mkdir(parents=True, exist_ok=True)
-    tmp = USER_FILE.with_suffix(".md.controlled-rollback.tmp")
-    shutil.copy2(backup, tmp)
-    os.replace(tmp, USER_FILE)
-
-
-def apply_fact(fact: Fact, *, dry_run: bool) -> tuple[str, str]:
-    current = USER_FILE.read_text(encoding="utf-8", errors="replace") if USER_FILE.exists() else ""
-    if existing_fact(current, fact):
-        return "already_present", "equivalent fact already exists in USER.md"
-    if dry_run:
-        return "would_apply", "dry-run: fact passed all gates"
-
-    backup = backup_user_file()
-    try:
-        store = load_memory_store()
-        result = store.apply_batch("user", [{"action": "add", "content": fact.content}])
-        if not result.get("success"):
-            return "queued_capacity_or_guard", str(result.get("error") or "MemoryStore rejected write")
-
-        verified = USER_FILE.read_text(encoding="utf-8", errors="replace")
-        if not existing_fact(verified, fact):
-            restore_user_file(backup)
-            return "rolled_back", "write returned success but verification failed; backup restored"
-        return "applied", f"verified native MemoryStore write; backup={backup}"
-    except Exception as exc:
-        restore_user_file(backup)
-        return "rolled_back", f"{type(exc).__name__}: {exc}; backup restored"
+def stage_fact(fact: Fact, *, dry_run: bool) -> tuple[str, str]:
+    # This scheduled background job has no live turn owner, profile routing,
+    # or user acknowledgement boundary.  It must not create user-facing Vault
+    # records (in particular in the legacy main-home store).  Keep its review
+    # report so a user-approved path can act later, but fail closed here.
+    return (
+        "blocked_non_authoritative",
+        "background learning may not write durable Vault memory without a live authoritative turn",
+    )
 
 
 def build_facts(candidates: list[dict[str, Any]]) -> tuple[list[Fact], list[Decision]]:
@@ -205,7 +194,7 @@ def build_facts(candidates: list[dict[str, Any]]) -> tuple[list[Fact], list[Deci
         if candidate.get("status") != "stage_user_memory":
             if candidate.get("status") in {"manual_review", "stage_skill_rule"}:
                 decisions.append(
-                    Decision(cid, "queued_policy", "only low-risk USER.md preference candidates are auto-eligible")
+                    Decision(cid, "queued_policy", "only low-risk durable user facts are eligible for vault staging")
                 )
             continue
         if candidate.get("risk") != "low" or int(candidate.get("score") or 0) < 8:
@@ -216,7 +205,7 @@ def build_facts(candidates: list[dict[str, Any]]) -> tuple[list[Fact], list[Deci
             decisions.append(Decision(cid, "queued_source", f"source {source or 'unknown'} is not a direct-user channel"))
             continue
 
-        extracted = extract_preference_facts(str(candidate.get("text") or ""))
+        extracted = extract_durable_facts(str(candidate.get("text") or ""))
         if not extracted:
             decisions.append(
                 Decision(cid, "queued_ambiguous", "candidate could not be reduced to a conservative structured fact")
@@ -282,19 +271,19 @@ def write_report(
         "",
         "## Guardrails",
         "",
-        "- Target: memories/USER.md only.",
-        "- Auto-eligible: repeated, low-risk, direct-user, structured preferences.",
-        "- High-risk, ambiguous, skill, MEMORY.md, config, and external-memory writes: blocked.",
-        "- Write path: native MemoryStore with backup, verification, and rollback.",
+        "- Target: the local Vault authority only.",
+        "- Auto-eligible: low-risk, direct-user, conservatively structured facts.",
+        "- Every recovered fact is staged through Vault governance; this job never activates it.",
+        "- USER.md, MEMORY.md, skills, config, and secrets are never written.",
         f"- Dry run: {dry_run}",
         "",
         "## Summary",
         "",
         f"- Source action report: {action_report}",
         f"- Structured facts: {len(facts)}",
-        f"- Applied: {outcomes['applied']}",
-        f"- Already present: {outcomes['already_present']}",
-        f"- Queued or blocked: {sum(value for key, value in outcomes.items() if key not in {'applied', 'already_present'})}",
+        f"- Staged: {outcomes['staged']}",
+        f"- Already stored: {outcomes['already_active'] + outcomes['already_staged']}",
+        f"- Queued or blocked: {sum(value for key, value in outcomes.items() if key not in {'staged', 'already_active', 'already_staged'})}",
         "",
         "## Decisions",
         "",
@@ -310,6 +299,7 @@ def write_report(
         json_path,
         {
             "generated_at": now().isoformat(),
+            "target": "vault",
             "dry_run": dry_run,
             "action_report": str(action_report),
             "facts": [asdict(fact) for fact in facts],
@@ -342,53 +332,37 @@ def main() -> int:
     state = read_json(STATE_FILE, {})
     if not isinstance(state, dict):
         state = {}
-    state.setdefault("applied", {})
+    state.setdefault("staged", {})
     old_queue = prune_queue(state.get("queue") if isinstance(state.get("queue"), dict) else {})
     state["queue"] = {
         key: value
         for key, value in old_queue.items()
-        if isinstance(value, dict) and value.get("key_version") == 2
+        if isinstance(value, dict) and value.get("key_version") == 3
     }
 
     facts, decisions = build_facts(candidates)
-    current_user_text = USER_FILE.read_text(encoding="utf-8", errors="replace") if USER_FILE.exists() else ""
     for fact in facts:
-        if existing_fact(current_user_text, fact):
-            decision = Decision(
-                ",".join(fact.candidate_ids),
-                "already_present",
-                "equivalent fact already exists in USER.md",
-                fact.content,
-            )
-        elif fact.support < AUTO_MIN_SUPPORT:
-            decision = Decision(
-                fact.candidate_ids[0] if fact.candidate_ids else "",
-                "queued_insufficient_support",
-                f"support={fact.support}, requires {AUTO_MIN_SUPPORT} distinct candidates",
-                fact.content,
-            )
-        else:
-            outcome, reason = apply_fact(fact, dry_run=args.dry_run)
-            decision = Decision(
-                ",".join(fact.candidate_ids),
-                outcome,
-                reason,
-                fact.content,
-            )
-            if outcome == "applied":
-                state["applied"][fact.key] = {
-                    "content": fact.content,
-                    "applied_at": now().isoformat(),
-                    "support": fact.support,
-                    "candidate_ids": fact.candidate_ids,
-                }
+        outcome, reason = stage_fact(fact, dry_run=args.dry_run)
+        decision = Decision(
+            ",".join(fact.candidate_ids),
+            outcome,
+            reason,
+            fact.content,
+        )
+        if outcome == "staged":
+            state["staged"][fact.key] = {
+                "content": fact.content,
+                "staged_at": now().isoformat(),
+                "support": fact.support,
+                "candidate_ids": fact.candidate_ids,
+            }
         decisions.append(decision)
 
     for decision in decisions:
         queue_key = decision_queue_key(decision)
         if decision.outcome.startswith("queued"):
             state["queue"][queue_key] = {
-                "key_version": 2,
+                "key_version": 3,
                 "candidate_id": decision.candidate_id,
                 "outcome": decision.outcome,
                 "reason": decision.reason,
@@ -403,10 +377,14 @@ def main() -> int:
         write_json(STATE_FILE, state)
     md_path, json_path = write_report(action_report, facts, decisions, state, dry_run=args.dry_run)
 
-    applied = [decision for decision in decisions if decision.outcome in {"applied", "rolled_back"}]
-    if applied or args.print_clean:
-        print(f"Hermes controlled learning: {len(applied)} change events. Report: {md_path}; JSON: {json_path}")
-    return 0
+    changes = [
+        decision
+        for decision in decisions
+        if decision.outcome in {"staged", "error"}
+    ]
+    if changes or args.print_clean:
+        print(f"Hermes controlled learning: {len(changes)} change events. Report: {md_path}; JSON: {json_path}")
+    return 1 if any(decision.outcome == "error" for decision in decisions) else 0
 
 
 if __name__ == "__main__":

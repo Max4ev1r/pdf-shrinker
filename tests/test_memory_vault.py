@@ -14,6 +14,21 @@ import pytest
 
 VAULT_SOURCE = Path.home() / ".hermes" / "scripts" / "memory_vault.py"
 PLUGIN_SOURCE = Path.home() / ".hermes" / "plugins" / "vault" / "__init__.py"
+RETRIEVAL_EVAL_SOURCE = (
+    Path.home() / ".hermes" / "scripts" / "memory_retrieval_eval.py"
+)
+CONTROLLED_LEARNING_SOURCE = (
+    Path.home() / ".hermes" / "scripts" / "hermes_controlled_learning.py"
+)
+LEARNING_ACTIONS_SOURCE = (
+    Path.home() / ".hermes" / "scripts" / "hermes_learning_actions.py"
+)
+SELF_HEAL_SOURCE = (
+    Path.home() / ".hermes" / "scripts" / "hermes_self_heal.py"
+)
+MEMORY_GOVERNOR_SOURCE = (
+    Path.home() / ".hermes" / "scripts" / "memory_governor.py"
+)
 
 
 class FakeEmbedder:
@@ -44,6 +59,7 @@ def vault(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     module = importlib.util.module_from_spec(spec)
     sys.modules[name] = module
     spec.loader.exec_module(module)
+    module._real_get_local_embedder = module.get_local_embedder
     module.get_local_embedder = lambda: FakeEmbedder()
     module.ensure_layout()
     yield module
@@ -97,6 +113,23 @@ def test_rejected_update_can_be_observed_again(vault):
     assert second["id"] != first["id"]
 
 
+def test_repeating_current_update_is_idempotent(vault):
+    active, _ = vault.add_record("用户长期偏好蓝色", topic="other")
+
+    unchanged, created = vault.propose_update(
+        active["id"],
+        "用户长期偏好蓝色",
+        source="test",
+        evidence_session="session-a",
+    )
+
+    assert not created
+    assert unchanged["id"] == active["id"]
+    records = vault.read_jsonl(vault.RECORDS_PATH)
+    assert len(records) == 1
+    assert records[0]["status"] == "active"
+
+
 def test_superseded_version_cannot_be_updated_or_reactivated(vault):
     old, _ = vault.add_record("用户以前偏好红色", topic="other")
     new, _ = vault.propose_update(
@@ -130,6 +163,38 @@ def test_merge_candidate_cannot_be_promoted_without_superseding_match(vault):
 
     with pytest.raises(SystemExit, match="use merge"):
         vault.promote_record(candidate["id"])
+
+
+def test_review_rebases_sibling_update_onto_current_successor(vault):
+    old, _ = vault.add_record("用户以前偏好红色", topic="other")
+    first, _ = vault.propose_update(
+        old["id"],
+        "用户现在偏好蓝色",
+        source="test",
+        evidence_session="session-a",
+    )
+    second, _ = vault.propose_update(
+        old["id"],
+        "用户现在偏好绿色",
+        source="test",
+        evidence_session="session-b",
+    )
+
+    vault.review_record(first["id"], "approve")
+    merged = vault.review_record(second["id"], "approve")
+
+    records = {row["id"]: row for row in vault.read_jsonl(vault.RECORDS_PATH)}
+    assert records[old["id"]]["status"] == "superseded"
+    assert records[first["id"]]["status"] == "superseded"
+    assert records[first["id"]]["superseded_by"] == second["id"]
+    assert merged["status"] == "active"
+    assert merged["matched_id"] == first["id"]
+    assert merged["source"]["supersedes"] == first["id"]
+    assert merged["source"]["requested_supersedes"] == old["id"]
+
+    event = vault.read_jsonl(vault.HISTORY_PATH)[-1]
+    assert event["requested_active_id"] == old["id"]
+    assert event["resolved_active_id"] == first["id"]
 
 
 def test_secret_is_rejected_before_records_events_or_exports(vault):
@@ -276,6 +341,58 @@ def test_fts_aliases_find_home_assistant_from_natural_chinese(vault):
     assert results[0]["id"] == expected["id"]
 
 
+def test_local_search_filters_weak_candidates_before_ranking(
+    vault,
+    monkeypatch,
+):
+    manager = vault._local_index_manager()
+    sqlite3.connect(vault.LOCAL_INDEX_PATH).close()
+    monkeypatch.setattr(manager, "ensure", lambda records: False)
+    monkeypatch.setattr(manager, "fts_search", lambda conn, query, top_k: [
+        {"id": "dual", "title": "dual", "updated_at": "2026", "rank": -50.0},
+        {"id": "weak", "title": "weak", "updated_at": "2026", "rank": -5.0},
+    ])
+    monkeypatch.setattr(manager, "vector_search", lambda conn, query, top_k: [
+        {"id": "semantic", "title": "semantic", "updated_at": "2026", "semantic_score": 0.70},
+        {"id": "relative-tail", "title": "tail", "updated_at": "2026", "semantic_score": 0.59},
+        {"id": "dual", "title": "dual", "updated_at": "2026", "semantic_score": 0.50},
+        {"id": "weak", "title": "weak", "updated_at": "2026", "semantic_score": 0.55},
+    ])
+
+    results = manager.search([], "query", top_k=10)
+
+    assert [row["id"] for row in results] == ["dual", "semantic"]
+
+
+def test_local_search_allows_zero_results(vault, monkeypatch):
+    manager = vault._local_index_manager()
+    sqlite3.connect(vault.LOCAL_INDEX_PATH).close()
+    monkeypatch.setattr(manager, "ensure", lambda records: False)
+    monkeypatch.setattr(manager, "fts_search", lambda conn, query, top_k: [
+        {"id": "noise", "title": "noise", "updated_at": "2026", "rank": -4.0},
+    ])
+    monkeypatch.setattr(manager, "vector_search", lambda conn, query, top_k: [
+        {"id": "noise", "title": "noise", "updated_at": "2026", "semantic_score": 0.45},
+    ])
+
+    assert manager.search([], "query", top_k=10) == []
+
+
+def test_local_search_keeps_lexical_hits_when_embeddings_are_unavailable(
+    vault,
+    monkeypatch,
+):
+    manager = vault._local_index_manager()
+    sqlite3.connect(vault.LOCAL_INDEX_PATH).close()
+    monkeypatch.setattr(manager, "ensure", lambda records: False)
+    monkeypatch.setattr(manager, "fts_search", lambda conn, query, top_k: [
+        {"id": "exact", "title": "exact", "updated_at": "2026", "rank": -4.0},
+    ])
+    monkeypatch.setattr(manager, "vector_search", lambda conn, query, top_k: [])
+
+    assert [row["id"] for row in manager.search([], "query", top_k=10)] == ["exact"]
+
+
 def test_local_index_rebuild_is_safe_across_processes(vault, tmp_path: Path):
     vault.add_record("Home Assistant 空调控制使用 ha_control.py", topic="hermes_ops")
     worker = tmp_path / "index_worker.py"
@@ -327,6 +444,27 @@ for _ in range(8):
         assert conn.execute("SELECT COUNT(*) FROM memories").fetchone()[0] == 1
 
 
+def test_local_embedder_uses_durable_hermes_cache(vault, monkeypatch):
+    calls = []
+
+    class Embedder:
+        def __init__(self, *, model_name, cache_dir):
+            calls.append((model_name, cache_dir))
+
+    import fastembed
+
+    monkeypatch.setattr(fastembed, "TextEmbedding", Embedder)
+    vault._LOCAL_EMBEDDER = None
+
+    embedder = vault._real_get_local_embedder()
+
+    assert isinstance(embedder, Embedder)
+    assert calls == [(
+        vault.LOCAL_EMBEDDING_MODEL,
+        str(vault.HERMES_HOME / "cache" / "fastembed"),
+    )]
+
+
 def load_vault_provider_module():
     name = f"_test_vault_provider_{uuid.uuid4().hex}"
     spec = importlib.util.spec_from_file_location(name, PLUGIN_SOURCE)
@@ -335,6 +473,400 @@ def load_vault_provider_module():
     sys.modules[name] = module
     spec.loader.exec_module(module)
     return name, module
+
+
+def load_retrieval_eval_module():
+    name = f"_test_memory_retrieval_eval_{uuid.uuid4().hex}"
+    spec = importlib.util.spec_from_file_location(name, RETRIEVAL_EVAL_SOURCE)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[name] = module
+    spec.loader.exec_module(module)
+    return name, module
+
+
+def load_controlled_learning_module():
+    name = f"_test_controlled_learning_{uuid.uuid4().hex}"
+    spec = importlib.util.spec_from_file_location(
+        name,
+        CONTROLLED_LEARNING_SOURCE,
+    )
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[name] = module
+    spec.loader.exec_module(module)
+    return name, module
+
+
+def load_learning_actions_module():
+    name = f"_test_learning_actions_{uuid.uuid4().hex}"
+    spec = importlib.util.spec_from_file_location(name, LEARNING_ACTIONS_SOURCE)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[name] = module
+    spec.loader.exec_module(module)
+    return name, module
+
+
+def load_self_heal_module():
+    name = f"_test_self_heal_{uuid.uuid4().hex}"
+    spec = importlib.util.spec_from_file_location(name, SELF_HEAL_SOURCE)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[name] = module
+    spec.loader.exec_module(module)
+    return name, module
+
+
+def load_memory_governor_module():
+    name = f"_test_memory_governor_{uuid.uuid4().hex}"
+    spec = importlib.util.spec_from_file_location(
+        name,
+        MEMORY_GOVERNOR_SOURCE,
+    )
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[name] = module
+    spec.loader.exec_module(module)
+    return name, module
+
+
+def test_production_retrieval_accepts_local_hot_path():
+    name, retrieval = load_retrieval_eval_module()
+
+    class Provider:
+        @staticmethod
+        def handle_tool_call(tool_name, args):
+            assert tool_name == "vault_search"
+            assert args["top_k"] == 10
+            return json.dumps({
+                "results": [{"id": "mem_expected", "summary": "expected"}],
+                "mode": "local-hybrid",
+            })
+
+    try:
+        result = retrieval.evaluate_case(
+            Provider(),
+            {
+                "name": "local-hot-path",
+                "query": "query",
+                "expected_any": ["mem_expected"],
+            },
+            accepted_modes={"hybrid", "local-hybrid"},
+        )
+
+        assert result["passed"]
+        assert result["content_passed"]
+        assert result["mode_passed"]
+        assert result["error"] == ""
+    finally:
+        sys.modules.pop(name, None)
+
+
+def test_retrieval_eval_requires_negative_queries_to_abstain():
+    name, retrieval = load_retrieval_eval_module()
+
+    class Provider:
+        @staticmethod
+        def handle_tool_call(tool_name, args):
+            return json.dumps({
+                "results": [{"id": "mem_noise", "summary": "noise"}],
+                "mode": "local-hybrid",
+            })
+
+    try:
+        result = retrieval.evaluate_case(
+            Provider(),
+            {
+                "name": "negative",
+                "query": "hello",
+                "expected_any": [],
+                "allowed_ids": [],
+                "expect_empty": True,
+            },
+            accepted_modes={"local-hybrid"},
+        )
+
+        assert not result["passed"]
+        assert not result["content_passed"]
+        assert not result["precision_passed"]
+    finally:
+        sys.modules.pop(name, None)
+
+
+def test_controlled_learning_extracts_only_conservative_durable_facts():
+    name, controlled = load_controlled_learning_module()
+    try:
+        extract = controlled.extract_durable_facts
+        assert extract("请记住：我以后偏好蓝色界面")
+        assert extract("我老婆叫测试配偶") == [
+            ("family:spouse:测试配偶", "配偶：测试配偶。"),
+        ]
+        assert extract("我喜欢简洁直接的回答")
+        assert extract("我现在的是微星4080，不是七彩虹") == []
+        assert extract("帮我算一下 37 乘以 19") == []
+        assert extract("不是记下来。你要开始改。") == []
+    finally:
+        sys.modules.pop(name, None)
+
+
+def test_controlled_learning_blocks_non_authoritative_vault_write(
+    vault,
+    monkeypatch,
+):
+    name, controlled = load_controlled_learning_module()
+    try:
+        monkeypatch.setattr(controlled, "load_memory_vault", lambda: vault)
+        user_file = vault.HERMES_HOME / "memories" / "USER.md"
+        before_exists = user_file.exists()
+        before = (
+            user_file.read_text(encoding="utf-8")
+            if before_exists
+            else ""
+        )
+        fact = controlled.Fact(
+            key="preference:test",
+            content="用户长期偏好蓝色界面",
+            support=2,
+            candidate_ids=["session-a", "session-b"],
+            source_messages=["a", "b"],
+        )
+
+        outcome, reason = controlled.stage_fact(fact, dry_run=False)
+
+        assert outcome == "blocked_non_authoritative"
+        assert "may not write durable Vault memory" in reason
+        assert vault.pending_records() == []
+        assert user_file.exists() == before_exists
+        if before_exists:
+            assert user_file.read_text(encoding="utf-8") == before
+    finally:
+        sys.modules.pop(name, None)
+
+
+def test_controlled_learning_never_stages_high_risk_candidate():
+    name, controlled = load_controlled_learning_module()
+    try:
+        facts, decisions = controlled.build_facts([{
+            "id": "candidate",
+            "status": "stage_user_memory",
+            "risk": "high",
+            "score": 8,
+            "source": "weixin",
+            "text": "记住：用户当前血压为140/95",
+        }])
+
+        assert facts == []
+        assert decisions[0].outcome == "queued_policy"
+    finally:
+        sys.modules.pop(name, None)
+
+
+def test_existing_pending_candidate_is_reclassified_by_current_policy(
+    vault,
+    monkeypatch,
+):
+    first, created = vault.propose_record(
+        "用户长期偏好蓝色界面",
+        source="test",
+        evidence_session="session-a",
+    )
+    assert created
+    assert first["risk"] == "low"
+    monkeypatch.setattr(vault, "is_high_risk_memory", lambda body, topic: True)
+
+    second, created = vault.propose_record(
+        "用户长期偏好蓝色界面",
+        source="test",
+        evidence_session="session-b",
+    )
+
+    assert not created
+    assert second["id"] == first["id"]
+    assert second["risk"] == "high"
+    assert second["review_status"] == "needs_user_review"
+    assert vault.evidence_count(second["id"]) == 2
+
+
+def test_governor_rechecks_risk_before_auto_promotion(
+    vault,
+    tmp_path,
+    monkeypatch,
+):
+    candidate, _ = vault.propose_record(
+        "用户长期偏好蓝色界面",
+        source="test",
+        evidence_session="session-a",
+    )
+    vault.propose_record(
+        "用户长期偏好蓝色界面",
+        source="test",
+        evidence_session="session-b",
+    )
+    name, governor = load_memory_governor_module()
+    try:
+        monkeypatch.setattr(governor, "load_memory_vault", lambda: vault)
+        monkeypatch.setattr(
+            governor,
+            "STATE_FILE",
+            tmp_path / "governor-state.json",
+        )
+        monkeypatch.setattr(
+            vault,
+            "is_high_risk_memory",
+            lambda body, topic: True,
+        )
+
+        payload = governor.run_governance(dry_run=False, no_sync=True)
+
+        assert payload["auto_promoted"] == []
+        assert [row["id"] for row in payload["needs_user_review"]] == [
+            candidate["id"],
+        ]
+        stored = {
+            row["id"]: row
+            for row in vault.read_jsonl(vault.RECORDS_PATH)
+        }
+        assert stored[candidate["id"]]["status"] == "pending"
+        assert stored[candidate["id"]]["risk"] == "high"
+        assert (
+            stored[candidate["id"]]["review_status"]
+            == "needs_user_review"
+        )
+    finally:
+        sys.modules.pop(name, None)
+
+
+def test_learning_actions_routes_durable_facts_to_vault_and_keeps_risk():
+    name, actions = load_learning_actions_module()
+    try:
+        base = {
+            "session_id": "session",
+            "timestamp": 1,
+            "source": "weixin",
+            "title": "",
+            "role": "user",
+            "tool_name": "",
+        }
+        preference = actions.classify_user_message(
+            {**base, "content": "我以后都喜欢直接给结论"},
+            set(),
+        )
+        health = actions.classify_user_message(
+            {**base, "content": "记住：我的剂量改成5mg"},
+            set(),
+        )
+        correction = actions.classify_user_message(
+            {**base, "content": "我现在的是微星4080，不是七彩虹"},
+            set(),
+        )
+
+        assert preference is not None
+        assert preference.status == "stage_user_memory"
+        assert preference.target == "Vault candidate"
+        assert health is not None
+        assert health.status == "manual_review"
+        assert health.risk == "high"
+        assert correction is not None
+        assert correction.status == "manual_review"
+        assert correction.target == "Vault update candidate"
+    finally:
+        sys.modules.pop(name, None)
+
+
+def test_self_heal_verifies_controlled_learning_vault_target(
+    tmp_path,
+    monkeypatch,
+):
+    name, self_heal = load_self_heal_module()
+    try:
+        monkeypatch.setattr(self_heal, "HERMES_HOME", tmp_path)
+        report_dir = tmp_path / "reports" / "controlled-learning"
+        report_dir.mkdir(parents=True)
+        (report_dir / "20260726-000000.json").write_text(
+            json.dumps({
+                "target": "vault",
+                "decisions": [{"outcome": "staged"}],
+            }),
+            encoding="utf-8",
+        )
+        events = []
+
+        self_heal.check_controlled_learning_report(events)
+
+        assert len(events) == 1
+        assert events[0].status == "vault_target_verified"
+        assert not events[0].notify
+    finally:
+        sys.modules.pop(name, None)
+
+
+@pytest.mark.parametrize(
+    ("dry_run", "expected_saves"),
+    [(True, 0), (False, 1)],
+)
+def test_self_heal_dry_run_does_not_persist_state(
+    tmp_path,
+    monkeypatch,
+    dry_run,
+    expected_saves,
+):
+    name, self_heal = load_self_heal_module()
+    try:
+        state = {"marker": "unchanged"}
+        monkeypatch.setattr(self_heal, "load_state", lambda: state)
+        monkeypatch.setattr(self_heal, "memory_provider", lambda: "vault")
+        for function_name in (
+            "check_hindsight",
+            "check_telegram_gateway",
+            "check_memory_config",
+            "enforce_controlled_write_gates",
+            "check_builtin_memory_capacity",
+            "check_astrology_semantics",
+            "check_capacity",
+            "check_reports",
+            "check_memory_governance_report",
+            "check_controlled_learning_report",
+            "prune_generated_reports",
+            "check_script_health",
+            "check_cron_jobs",
+            "check_cron_prompt_memory_writes",
+            "update_known_issues",
+        ):
+            monkeypatch.setattr(
+                self_heal,
+                function_name,
+                lambda *args, **kwargs: None,
+            )
+        monkeypatch.setattr(self_heal, "load_jobs", lambda: [])
+        saves = []
+        monkeypatch.setattr(
+            self_heal,
+            "save_state",
+            lambda payload: saves.append(payload),
+        )
+        monkeypatch.setattr(
+            self_heal,
+            "write_report",
+            lambda events, payload: (
+                tmp_path / "report.md",
+                tmp_path / "report.json",
+            ),
+        )
+        monkeypatch.setattr(
+            self_heal,
+            "notification_text",
+            lambda events, path: "",
+        )
+        argv = ["hermes_self_heal.py"]
+        if dry_run:
+            argv.append("--dry-run")
+        monkeypatch.setattr(self_heal.sys, "argv", argv)
+
+        assert self_heal.main() == 0
+        assert len(saves) == expected_saves
+    finally:
+        sys.modules.pop(name, None)
 
 
 def test_explicit_memory_parser_is_narrow():
@@ -350,7 +882,7 @@ def test_explicit_memory_parser_is_narrow():
         sys.modules.pop(name, None)
 
 
-def test_explicit_low_risk_request_is_promoted_without_storing_raw_turn():
+def test_explicit_conflicting_request_is_not_promoted_as_second_active_truth():
     name, plugin = load_vault_provider_module()
 
     class FakeVault:
@@ -366,9 +898,9 @@ def test_explicit_low_risk_request_is_promoted_without_storing_raw_turn():
             return {
                 "id": "candidate-1",
                 "status": "pending",
-                "risk": "low",
-                "governance_action": "add",
-                "matched_id": "",
+                "risk": "high",
+                "governance_action": "needs_user_review",
+                "matched_id": "weak-similar-memory",
             }, True
 
         def promote_record(self, record_id, **kwargs):
@@ -394,8 +926,162 @@ def test_explicit_low_risk_request_is_promoted_without_storing_raw_turn():
                 },
             )
         ]
-        assert provider._vault.promotions == [
-            ("candidate-1", {"reason": "explicit user request to remember"})
-        ]
+        assert provider._vault.promotions == []
+    finally:
+        sys.modules.pop(name, None)
+
+
+def test_direct_remember_does_not_activate_a_merge_candidate():
+    name, plugin = load_vault_provider_module()
+    try:
+        assert not plugin.VaultMemoryProvider._is_direct_add({
+            "status": "pending",
+            "risk": "high",
+            "governance_action": "merge",
+            "matched_id": "active-memory",
+        })
+    finally:
+        sys.modules.pop(name, None)
+
+
+def test_vault_remember_activates_direct_low_risk_fact(vault):
+    name, plugin = load_vault_provider_module()
+    try:
+        provider = plugin.VaultMemoryProvider()
+        provider._vault = vault
+        provider._session_id = "turn-session"
+
+        payload = json.loads(provider.handle_tool_call(
+            "vault_remember",
+            {"content": "用户长期偏好蓝色界面"},
+        ))
+
+        assert payload["status"] == "active"
+        assert payload["result"] == "Durable memory stored."
+        active = vault.active_records_by_id()
+        assert payload["id"] in active
+    finally:
+        sys.modules.pop(name, None)
+
+
+def test_vault_remember_activates_direct_sensitive_fact(vault):
+    name, plugin = load_vault_provider_module()
+    try:
+        provider = plugin.VaultMemoryProvider()
+        provider._vault = vault
+        provider._session_id = "turn-session"
+
+        payload = json.loads(provider.handle_tool_call(
+            "vault_remember",
+            {
+                "content": (
+                    "用户截至2026-07-23持有测试资产1800份，"
+                    "参考成本33.740测试币。"
+                )
+            },
+        ))
+
+        assert payload["status"] == "active"
+        assert payload["risk"] == "high"
+        assert payload["result"] == "Durable memory stored."
+        assert payload["id"] in vault.active_records_by_id()
+        record = vault.active_records_by_id()[payload["id"]]
+        assert record["governance_action"] == "add"
+    finally:
+        sys.modules.pop(name, None)
+
+
+def test_background_sensitive_candidate_stays_pending(vault):
+    name, plugin = load_vault_provider_module()
+    try:
+        provider = plugin.VaultMemoryProvider()
+        provider._vault = vault
+        provider._session_id = "turn-session"
+
+        result = provider.propose_candidate(
+            "用户有高血压，当前血压为135/90",
+            {
+                "source_type": "user_fact",
+                "domain": "medical",
+                "source_session_id": "source-session",
+            },
+        )
+
+        assert result is not None
+        assert result["status"] == "pending"
+        assert result["risk"] == "high"
+        assert result["id"] not in vault.active_records_by_id()
+    finally:
+        sys.modules.pop(name, None)
+
+
+def test_vault_update_immediately_versions_low_risk_correction(vault):
+    old, _ = vault.add_record("用户长期偏好红色界面", topic="profile")
+    name, plugin = load_vault_provider_module()
+    try:
+        provider = plugin.VaultMemoryProvider()
+        provider._vault = vault
+        provider._session_id = "turn-session"
+
+        first = json.loads(provider.handle_tool_call(
+            "vault_update",
+            {
+                "memory_id": old["id"],
+                "content": "用户长期偏好蓝色界面",
+            },
+        ))
+        second = json.loads(provider.handle_tool_call(
+            "vault_update",
+            {
+                "memory_id": old["id"],
+                "content": "用户长期偏好蓝色界面",
+            },
+        ))
+
+        assert first["status"] == "active"
+        assert first["replaces"] == old["id"]
+        assert second["id"] == first["id"]
+        records = vault.read_jsonl(vault.RECORDS_PATH)
+        assert len(records) == 2
+        statuses = {record["id"]: record["status"] for record in records}
+        assert statuses[old["id"]] == "superseded"
+        assert statuses[first["id"]] == "active"
+    finally:
+        sys.modules.pop(name, None)
+
+
+def test_vault_update_immediately_versions_direct_sensitive_correction(vault):
+    old, _ = vault.add_record(
+        "用户截至2026-07-23持有测试资产1800份，参考成本33.740测试币。",
+        topic="投资持仓",
+    )
+    name, plugin = load_vault_provider_module()
+    try:
+        provider = plugin.VaultMemoryProvider()
+        provider._vault = vault
+        provider._session_id = "turn-session"
+
+        payload = json.loads(provider.handle_tool_call(
+            "vault_update",
+            {
+                "memory_id": old["id"],
+                "content": (
+                    "用户截至2026-08-01持有测试资产2000份，"
+                    "平均成本33.500测试币。"
+                ),
+            },
+        ))
+
+        assert payload["status"] == "active"
+        assert payload["result"] == "Durable memory updated."
+        records = {
+            record["id"]: record
+            for record in vault.read_jsonl(vault.RECORDS_PATH)
+        }
+        assert records[old["id"]]["status"] == "superseded"
+        assert records[payload["id"]]["status"] == "active"
+        assert records[payload["id"]]["risk"] == "high"
+        assert "2026-07-23" in records[old["id"]]["body"]
+        assert "2026-08-01" in records[payload["id"]]["body"]
     finally:
         sys.modules.pop(name, None)
