@@ -35,26 +35,19 @@ def _item(section: str, index: int, source: str, score: float) -> dict:
     }
 
 
-def test_dynamic_allocation_keeps_balance_and_source_diversity(monkeypatch):
-    news = {}
-    for section in ("domestic", "world", "tech"):
-        news[section] = [
-            _item(section, index, f"{section}-source-{index}", 120 - index)
-            for index in range(5)
-        ]
+def test_sections_do_not_fill_to_quota(monkeypatch):
+    news = {
+        "domestic": [_item("domestic", 1, "domestic-source", 120)],
+        "world": [],
+        "tech": [],
+    }
     monkeypatch.setattr(briefing, "rank_items", lambda items, _section: items)
 
     selected = briefing.select_sections({"news": news})
 
     counts = {section: len(items) for section, items in selected.items()}
-    assert sum(counts.values()) == briefing.BRIEF_ITEM_COUNT
-    assert all(
-        briefing.SECTION_MIN_COUNT <= count <= briefing.SECTION_MAX_COUNT
-        for count in counts.values()
-    )
-    for items in selected.values():
-        sources = [item["display_source"] for item in items]
-        assert len(sources) == len(set(sources))
+    assert counts == {"domestic": 1, "world": 0, "tech": 0}
+    assert sum(counts.values()) < 9
 
 
 def test_decision_value_rewards_relevance_and_penalizes_generic_local_event():
@@ -139,11 +132,77 @@ def test_render_has_no_repeated_generic_footer_or_reminder():
 
 def test_focus_requires_substantive_evidence():
     weak = _item("domestic", 1, "国内源", 130)
-    weak["summary"] = weak["title"] + " 国内源"
+    weak["summary"] = ""
     strong = _item("tech", 1, "科技源", 125)
     selected = {"domestic": [weak], "world": [], "tech": [strong]}
 
     assert briefing.choose_focus(selected) is strong
+
+
+def test_short_summary_can_be_focus():
+    short = _item("world", 1, "财联社", 130)
+    short["title"] = "伊朗外长说无意延长停火协议"
+    short["original_title"] = short["title"]
+    short["summary"] = "伊朗外长说无意延长停火协议。"
+    selected = {"domestic": [], "world": [short], "tech": []}
+
+    assert briefing.choose_focus(selected) is short
+
+
+def test_focus_not_repeated_in_sections():
+    focus = _item("tech", 1, "科技源", 130)
+    focus["title"] = "Anthropic 发布新模型"
+    focus["original_title"] = focus["title"]
+    other = _item("domestic", 1, "国内源", 120)
+    selected = {"domestic": [other], "world": [], "tech": [focus]}
+    payload = {
+        "weather": {
+            "ok": True,
+            "condition": "晴",
+            "current_c": 24,
+            "min_c": 20,
+            "max_c": 28,
+            "rain_probability": 10,
+            "commute_rain_probability": 5,
+            "wind_kmh": 8,
+            "commute_wind_kmh": 10,
+        },
+    }
+    enhancement = {
+        "focus": {
+            "index": 1,
+            "what": "Anthropic 发布新模型已经发布",
+            "why": "值得关注",
+        },
+    }
+
+    rendered = briefing.render_message(
+        payload,
+        selected=selected,
+        enhancement=enhancement,
+    )
+
+    assert rendered.count(focus["title"]) == 1
+
+
+def test_domestic_story_not_world():
+    item = _item("world", 1, "新华网", 130)
+    item["title"] = "中国央行将开展1万亿元买断式逆回购操作"
+    item["original_title"] = item["title"]
+    item["category"] = "world"
+    item["article_type"] = "policy"
+
+    assert briefing.item_is_eligible(item, "world") is False
+
+
+def test_ai_story_not_world_when_obvious():
+    item = _item("world", 1, "IT之家", 130)
+    item["title"] = "前谷歌员工打造AI聊天机器人"
+    item["original_title"] = item["title"]
+    item["category"] = "world"
+    item["article_type"] = "tech_core"
+
+    assert briefing.item_is_eligible(item, "world") is False
 
 
 def test_model_failure_returns_deterministic_fallback(monkeypatch):

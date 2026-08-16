@@ -186,6 +186,22 @@ WORLD_NOISE_RE = re.compile(r"^视频|^視頻|港股|A股|概念走强|机构称
 WORLD_TECH_FEATURE_RE = re.compile(r"AI浪潮.*苹果|蘋果產品.*漲價|苹果产品.*涨价|专家：追落后|OpenAI|GPT")
 WORLD_CHINA_LOCAL_RE = re.compile(r"北京|上海|广州|深圳|重庆|浙江|云南|中国尊|香港|澳门|台湾")
 WORLD_CROSS_BORDER_RE = re.compile(r"国际|全球|海外|外国|美国|美方|欧盟|欧洲|英国|法国|德国|日本|韩国|卢森堡|联合国|G7|北约|中美|中欧|中日|中韩|对外|出口|进口|制裁|关税|战争|冲突|停火|伊朗|以色列|霍尔木兹|俄乌|俄罗斯|乌克兰")
+DOMESTIC_POLICY_RE = re.compile(
+    r"国务院|中国央行|央行|人民银行|财政部|证监会|医保|教育部|地方财政|"
+    r"央行报告|"
+    r"(?:中国|我国|国内).*(?:政策|财政|经济|监管|逆回购|预算|发布|运行|报告)|"
+    r"(?:内蒙古|各省|地方).*(?:财政|政策|经济|政府)",
+    re.I,
+)
+DOMESTIC_POLICY_STRONG_RE = re.compile(
+    r"国务院|中国央行|人民银行|证监会|地方财政|央行报告|(?:中国|我国|国内).*财政部",
+    re.I,
+)
+OBVIOUS_TECH_RE = re.compile(
+    r"(?<![A-Za-z])AI(?![A-Za-z])|人工智能|大模型|OpenAI|Anthropic|DeepMind|"
+    r"芯片|半导体|GPU|TPU|机器人|自动驾驶|FSD",
+    re.I,
+)
 TECH_MARKET_OPINION_RE = re.compile(r"知名投行|标普500|继续.*发力|采用率|使用强度|Token踩刹车|AI.*泡沫|私募圈AI|不敢再参与")
 TECH_PROMO_RE = re.compile(
     r"科创绣带|用AI添翼|AI添翼|影视造梦|崛起.*(?:科创|AI)|"
@@ -265,9 +281,9 @@ CATEGORY_THRESHOLDS = {
 }
 
 SECTION_MINIMUMS = {
-    "domestic": 2,
-    "world": 2,
-    "tech": 2,
+    "domestic": 0,
+    "world": 0,
+    "tech": 0,
 }
 
 EXCLUSION_REASONS = {
@@ -281,9 +297,7 @@ EXCLUSION_REASONS = {
     "invalid_url", "tech_promo", "other_region_local",
 }
 
-SECTION_MIN_COUNT = 2
-SECTION_MAX_COUNT = 4
-BRIEF_ITEM_COUNT = 9
+SECTION_MAX_COUNT = 3
 
 PERSONAL_LOCAL_RE = re.compile(r"无锡|江苏|苏州|长三角")
 PERSONAL_POLICY_RE = re.compile(
@@ -516,6 +530,16 @@ def canonical_url(url: str) -> str:
 def title_key(title: str) -> str:
     s = re.sub(r"[^\w\u4e00-\u9fff]+", "", normalize_zh(title).lower())
     return s[:36]
+
+
+def same_story(left: dict[str, Any], right: dict[str, Any]) -> bool:
+    left_url = canonical_url(clean_text(left.get("url") or ""))
+    right_url = canonical_url(clean_text(right.get("url") or ""))
+    if left_url and right_url and left_url == right_url:
+        return True
+    left_title = title_key(left.get("original_title") or left.get("title") or "")
+    right_title = title_key(right.get("original_title") or right.get("title") or "")
+    return bool(left_title and right_title and left_title == right_title)
 
 
 def recent_title_keys(days: int = 7) -> set[str]:
@@ -1276,6 +1300,22 @@ def fmt_items(
     return lines
 
 
+def world_category_issue(item: dict[str, Any]) -> str | None:
+    title = normalize_zh(item.get("original_title") or item.get("title") or "")
+    if DOMESTIC_POLICY_STRONG_RE.search(title) or (
+        DOMESTIC_POLICY_RE.search(title) and not WORLD_CROSS_BORDER_RE.search(title)
+    ):
+        return "domestic"
+    if OBVIOUS_TECH_RE.search(title) and not re.search(
+        r"战争|冲突|停火|制裁|关税|出口|进口|供应链|禁令|政策|监管|贸易|限制",
+        title,
+    ):
+        return "tech"
+    if not WORLD_CROSS_BORDER_RE.search(title) and item.get("article_type") != "conflict":
+        return "drop"
+    return None
+
+
 def item_is_eligible(item: dict[str, Any], section: str) -> bool:
     reasons = set(item.get("score_reasons", []))
     if EXCLUSION_REASONS.intersection(reasons):
@@ -1286,6 +1326,9 @@ def item_is_eligible(item: dict[str, Any], section: str) -> bool:
         return False
     if section == "domestic" and item.get("article_type") not in {"policy", "hard_news", "market"}:
         return False
+    if section == "world":
+        if world_category_issue(item):
+            return False
     if section == "world" and item.get("article_type") not in {"conflict", "policy", "hard_news", "market"}:
         if item.get("tier") != "A" or item.get("score", 0) < 95:
             return False
@@ -1321,13 +1364,14 @@ def pick_items(items: list[dict[str, Any]], n: int, source_limit: int = 2) -> li
 
 
 def substantive_summary(item: dict[str, Any]) -> str:
+    """Return usable material without making summary length an importance gate."""
     summary = clean_text(item.get("summary") or "")
-    if len(summary) < 45:
-        return ""
     title = clean_text(item.get("original_title") or item.get("title") or "")
-    source = clean_text(item.get("display_source") or normalized_source(item))
-    residue = summary.replace(title, "").replace(source, "").strip(" -—，。:：")
-    return summary if len(residue) >= 28 else ""
+    if not summary or not title or malformed_title(title):
+        return ""
+    if SECTION_PAGE_RE.search(title) or SECTION_PAGE_RE.search(item.get("url") or ""):
+        return ""
+    return summary
 
 
 def choose_focus(selected: dict[str, list[dict[str, Any]]]) -> dict[str, Any] | None:
@@ -1345,10 +1389,23 @@ def choose_focus(selected: dict[str, list[dict[str, Any]]]) -> dict[str, Any] | 
 
 def select_sections(payload: dict[str, Any]) -> dict[str, list[dict[str, Any]]]:
     news = payload.get("news", {})
+    section_inputs = {
+        "domestic": [dict(item) for item in news.get("domestic", [])],
+        "world": [dict(item) for item in news.get("world", [])],
+        "tech": [dict(item) for item in news.get("tech", [])],
+    }
+    for item in section_inputs["world"][:]:
+        redirect = world_category_issue(item)
+        if redirect in {"domestic", "tech"}:
+            section_inputs[redirect].append(
+                dict(item, category="ai" if redirect == "tech" else "domestic")
+            )
+            section_inputs["world"].remove(item)
+        elif redirect == "drop":
+            section_inputs["world"].remove(item)
     reranked = {
-        "domestic": rank_items([dict(x) for x in news.get("domestic", [])], "domestic"),
-        "world": rank_items([dict(x) for x in news.get("world", [])], "world"),
-        "tech": rank_items([dict(x) for x in news.get("tech", [])], "tech"),
+        section: rank_items(items, section)
+        for section, items in section_inputs.items()
     }
     candidates = {
         section: [item for item in items if item_is_eligible(item, section)]
@@ -1361,6 +1418,7 @@ def select_sections(payload: dict[str, Any]) -> dict[str, list[dict[str, Any]]]:
     }
     seen_titles: set[str] = set()
     seen_topics: set[str] = set()
+    seen_urls: set[str] = set()
     source_counts: dict[str, dict[str, int]] = {
         "domestic": {},
         "world": {},
@@ -1372,46 +1430,27 @@ def select_sections(payload: dict[str, Any]) -> dict[str, list[dict[str, Any]]]:
             return False
         key = title_key(item.get("title") or "")
         topic = item.get("topic_key") or topic_key(item)
+        url = canonical_url(clean_text(item.get("url") or ""))
         source = item.get("display_source") or normalized_source(item)
-        if key in seen_titles or topic in seen_topics:
+        if key in seen_titles or topic in seen_topics or (url and url in seen_urls):
             return False
         if source_counts[section].get(source, 0) >= source_limit:
             return False
         selected[section].append(item)
         seen_titles.add(key)
         seen_topics.add(topic)
+        if url:
+            seen_urls.add(url)
         source_counts[section][source] = source_counts[section].get(source, 0) + 1
         return True
 
-    # Preserve balanced coverage first: two independently sourced items per
-    # section. The remaining three slots compete on user value and impact.
+    # Keep only the best few items independently per section. Empty sections
+    # are valid; there is no cross-section fill pass.
     for section in ("domestic", "world", "tech"):
         for item in candidates[section]:
-            add(item, section, source_limit=1)
-            if len(selected[section]) >= SECTION_MIN_COUNT:
+            add(item, section, source_limit=2)
+            if len(selected[section]) >= SECTION_MAX_COUNT:
                 break
-
-    def fill(source_limit: int) -> None:
-        pool = sorted(
-            (
-                (item, section)
-                for section, items in candidates.items()
-                for item in items
-                if item not in selected[section]
-            ),
-            key=lambda pair: pair[0].get("brief_score", pair[0].get("score", 0)),
-            reverse=True,
-        )
-        for item, section in pool:
-            if sum(len(items) for items in selected.values()) >= BRIEF_ITEM_COUNT:
-                return
-            add(item, section, source_limit=source_limit)
-
-    fill(source_limit=1)
-    if sum(len(items) for items in selected.values()) < BRIEF_ITEM_COUNT:
-        # Quality is more important than an empty slot, but a second item from
-        # one publisher is an explicit fallback rather than the normal path.
-        fill(source_limit=2)
 
     for items in selected.values():
         items.sort(
@@ -1605,6 +1644,8 @@ def rejection_reasons(item: dict[str, Any], section: str) -> list[str]:
     if section == "world" and item.get("article_type") not in {"conflict", "policy", "hard_news", "market"}:
         if item.get("tier") != "A" or item.get("score", 0) < 95:
             rejected.append(f"world_type:{item.get('article_type')}")
+    if section == "world" and world_category_issue(item):
+        rejected.append("world_category_leak")
     return rejected or ["lower_ranked_or_source_limit"]
 
 
@@ -1671,25 +1712,6 @@ def source_health_summary(state: dict[str, Any]) -> dict[str, Any]:
 
 def audit_selected(selected: dict[str, list[dict[str, Any]]]) -> list[dict[str, Any]]:
     warnings = []
-    counts = {section: len(items) for section, items in selected.items()}
-    total = sum(counts.values())
-    if total < BRIEF_ITEM_COUNT:
-        warnings.append({
-            "severity": "warn",
-            "code": "brief_thin",
-            "count": total,
-            "target": BRIEF_ITEM_COUNT,
-        })
-    for section, minimum in SECTION_MINIMUMS.items():
-        count = counts.get(section, 0)
-        if count < minimum:
-            warnings.append({
-                "severity": "warn",
-                "code": "section_thin",
-                "section": section,
-                "count": count,
-                "minimum": minimum,
-            })
 
     seen_topics: dict[str, str] = {}
     for section, items in selected.items():
@@ -1741,6 +1763,13 @@ def audit_selected(selected: dict[str, list[dict[str, Any]]]) -> list[dict[str, 
                         "title": item.get("title"),
                         "article_type": item.get("article_type"),
                     })
+            if section == "world" and world_category_issue(item):
+                warnings.append({
+                    "severity": "error",
+                    "code": "world_category_leak",
+                    "section": section,
+                    "title": item.get("title"),
+                })
             topic = item.get("topic_key") or topic_key(item)
             if topic in seen_topics:
                 warnings.append({
@@ -1849,9 +1878,22 @@ def render_message(
     date_text = now().strftime("%Y年%m月%d日")
     selected = selected or select_sections(payload)
     title_overrides = (enhancement or {}).get("title_overrides") or {}
-    domestic_items = selected["domestic"]
-    world_items = selected["world"]
-    tech_items = selected["tech"]
+    all_items = flatten_selected(selected)
+    focus = (enhancement or {}).get("focus")
+    focus_item = None
+    if isinstance(focus, dict):
+        focus_index = focus.get("index")
+        if isinstance(focus_index, int) and 0 <= focus_index < len(all_items):
+            focus_item = all_items[focus_index]
+
+    def visible_items(items: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        if focus_item is None:
+            return list(items)
+        return [item for item in items if not same_story(item, focus_item)]
+
+    domestic_items = visible_items(selected["domestic"])
+    world_items = visible_items(selected["world"])
+    tech_items = visible_items(selected["tech"])
     domestic = fmt_items(
         domestic_items,
         len(domestic_items),
@@ -1862,16 +1904,16 @@ def render_message(
         world_items,
         len(world_items),
         title_overrides,
-        index_offset=len(domestic_items),
+        index_offset=len(selected["domestic"]),
     )
     tech = fmt_items(
         tech_items,
         len(tech_items),
         title_overrides,
-        index_offset=len(domestic_items) + len(world_items),
+        index_offset=len(selected["domestic"]) + len(selected["world"]),
     )
 
-    if not any([domestic, world, tech]):
+    if not any([domestic, world, tech]) and focus_item is None:
         return make_degraded_message("新闻源今日没有返回可验证条目")
 
     def block(title: str, lines: list[str]) -> str:
@@ -1881,17 +1923,12 @@ def render_message(
         f"☀️ 早，Max · {date_text}",
         "🌤 无锡天气\n" + weather_line(payload.get("weather", {})),
     ]
-    focus = (enhancement or {}).get("focus")
-    all_items = flatten_selected(selected)
-    if isinstance(focus, dict):
-        focus_index = focus.get("index")
-        if isinstance(focus_index, int) and 0 <= focus_index < len(all_items):
-            focus_item = all_items[focus_index]
-            blocks.append(
-                "🔥 今日重点\n"
-                f"发生了什么：{focus.get('what')}\n"
-                f"为什么值得关注：{focus.get('why')}{source_label(focus_item)}"
-            )
+    if focus_item is not None:
+        blocks.append(
+            "🔥 今日重点\n"
+            f"发生了什么：{focus.get('what')}\n"
+            f"为什么值得关注：{focus.get('why')}{source_label(focus_item)}"
+        )
     blocks.extend([
         block("🇨🇳 国内要闻", domestic),
         block("🌍 国际要闻", world),
@@ -1940,14 +1977,8 @@ def render() -> None:
     if payload is None:
         collect()
         payload = read_json(d / "input.json", {})
-    selected_before_recovery = select_sections(payload)
     weather_bad = not payload.get("weather", {}).get("ok")
-    core_section_thin = (
-        len(selected_before_recovery["domestic"]) < 2
-        or len(selected_before_recovery["world"]) < 2
-        or len(selected_before_recovery["tech"]) < 2
-    )
-    if weather_bad or core_section_thin:
+    if weather_bad:
         collect()
         payload = read_json(d / "input.json", payload)
     selected = select_sections(payload)
