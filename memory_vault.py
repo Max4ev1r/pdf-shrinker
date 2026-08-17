@@ -2,8 +2,11 @@
 """Local long-term memory vault for Max's Hermes install.
 
 This keeps MEMORY.md / USER.md small by moving durable but non-core facts into
-a local authority store. External vector memory providers may index this store,
-but the vault remains the source of truth.
+a local authority store. The vault is the complete production memory path:
+writes, SQLite/FTS5 retrieval, and local embeddings stay on this machine.
+
+The old mem0/Qdrant export and replay functions remain below only as dormant
+retirement/recovery code; normal Vault writes never enqueue or synchronize them.
 """
 
 from __future__ import annotations
@@ -16,6 +19,7 @@ import hashlib
 import importlib
 import importlib.util
 import json
+import logging
 import os
 import re
 import shutil
@@ -27,11 +31,14 @@ from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
 
+logger = logging.getLogger(__name__)
+
 SCRIPTS_DIR = Path(__file__).resolve().parent
 if str(SCRIPTS_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPTS_DIR))
 
 from memory_vault_lib import (
+
     LocalSearchIndex,
     MemoryGovernance,
     SecretMemoryRejected,
@@ -97,7 +104,7 @@ def configure_home(home: str | Path) -> None:
 
 ENTRY_DELIMITER = "\n§\n"
 SCHEMA_VERSION = 2
-LOCAL_INDEX_SCHEMA_VERSION = 2
+LOCAL_INDEX_SCHEMA_VERSION = 3
 LOCAL_EMBEDDING_MODEL = "BAAI/bge-small-zh-v1.5"
 
 try:
@@ -142,6 +149,10 @@ SEARCH_ALIAS_GROUPS = (
     (
         {"apple music", "苹果音乐", "无损", "aac"},
         {"apple", "music", "苹果音乐", "无损", "音质", "重开", "重置", "aac", "windows"},
+    ),
+    (
+        {"特斯拉", "tesla", "开什么车", "什么车", "车型", "座驾", "车辆"},
+        {"特斯拉", "tesla", "汽车", "车", "车型", "座驾", "车辆", "驾驶"},
     ),
     (
         {"唯一推荐", "明确理由", "不要模棱两可", "直接结论"},
@@ -403,10 +414,6 @@ def save_records(records: list[dict[str, Any]]) -> None:
                 "INSERT INTO events(history_id,previous_hash,event_hash,event_json) VALUES(?,?,?,?)",
                 (event["history_id"], previous, event_hash, json.dumps(event, ensure_ascii=False, sort_keys=True)),
             )
-            conn.execute(
-                "INSERT OR IGNORE INTO index_outbox(event_id,record_id,change_type,queued_at) VALUES(?,?,?,?)",
-                (event["history_id"], event["id"], event["change_type"], event["changed_at"]),
-            )
             previous = event_hash
         for evidence in evidences:
             conn.execute(
@@ -416,9 +423,7 @@ def save_records(records: list[dict[str, Any]]) -> None:
         conn.commit()
     _write_jsonl_file(RECORDS_PATH, records)
     _write_jsonl_file(HISTORY_PATH, read_jsonl(HISTORY_PATH))
-    _write_jsonl_file(OUTBOX_PATH, read_jsonl(OUTBOX_PATH))
     render_topics(records)
-    write_mem0_seed(records)
     rebuild_local_index(records)
     write_index(records)
 
@@ -549,11 +554,25 @@ def get_local_embedder():
     global _LOCAL_EMBEDDER
     with _EMBEDDER_LOCK:
         if _LOCAL_EMBEDDER is None:
+            # Ensure fastembed is installed before importing.
+            # This provides deterministic recovery after venv rebuild.
+            try:
+                from tools.lazy_deps import ensure
+                ensure("memory.vault", prompt=False)
+            except Exception as exc:
+                import logging
+                logging.getLogger(__name__).error(
+                    "Vault vector dependency (fastembed) unavailable: %s. "
+                    "Semantic/vector retrieval will be degraded to lexical-only.",
+                    exc,
+                )
+                raise
             from fastembed import TextEmbedding
 
             _LOCAL_EMBEDDER = TextEmbedding(
                 model_name=LOCAL_EMBEDDING_MODEL,
                 cache_dir=str(LOCAL_EMBEDDING_CACHE),
+                threads=1,
             )
     return _LOCAL_EMBEDDER
 
@@ -596,6 +615,29 @@ def rebuild_local_index(records: list[dict[str, Any]]) -> None:
 
 def ensure_local_index(records: list[dict[str, Any]]) -> bool:
     return _local_index_manager().ensure(records)
+
+
+def local_index_health(
+    records: list[dict[str, Any]] | None = None,
+) -> dict[str, Any]:
+    current = records if records is not None else read_jsonl(RECORDS_PATH)
+    health = _local_index_manager().health(current)
+    runtime_available = importlib.util.find_spec("fastembed") is not None
+    health["embedding_runtime_available"] = runtime_available
+    if health.get("active_records") and not runtime_available:
+        health["semantic_ready"] = False
+        health["mode"] = "lexical-only"
+        # Log explicit ERROR so silent degradation is surfaced.
+        logger.error(
+            "Vault vector backend unavailable: dependency=fastembed "
+            "component=vault/local-vector status=missing "
+            "semantic/vector retrieval degraded to lexical-only"
+        )
+    return health
+
+
+def local_search_mode() -> str:
+    return str(local_index_health().get("mode", "lexical-only"))
 
 
 def _fts_search(
@@ -879,11 +921,11 @@ def ensure_layout() -> None:
             "Local authority store for long-term memories. MEMORY.md and USER.md stay small; "
             "this vault stores durable facts, history, and topic views.\n\n"
             "Files:\n"
-            "- `vault.sqlite3`: transactional authoritative records, events, evidence, and index outbox.\n"
+            "- `vault.sqlite3`: transactional authoritative records, events, and evidence.\n"
             "- `memories.jsonl`: portable export of active/archived records.\n"
             "- `history.jsonl`: portable export of immutable history events.\n"
             "- `topics/*.md`: generated topic views for human browsing.\n"
-            "- `mem0_seed.jsonl`: export for mem0 indexing; not the source of truth.\n\n"
+            "- `local-search.sqlite3`: local FTS5/embedding retrieval index.\n\n"
             "Status values: `pending`, `active`, `superseded`, `archived`, `disputed`, `rejected`.\n",
             encoding="utf-8",
         )
@@ -905,7 +947,6 @@ def write_index(records: list[dict[str, Any]]) -> None:
         "core_policy": by_policy,
         "authority": str(VAULT_DB_PATH),
         "history": str(HISTORY_PATH),
-        "mem0_seed": str(MEM0_SEED_PATH),
     }
     INDEX_PATH.write_text(json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True) + "\n", encoding="utf-8")
 
@@ -1884,14 +1925,16 @@ def mem0_readiness() -> dict[str, Any]:
     }
     if ollama["required"]:
         deps["ollama"] = importlib.util.find_spec("ollama") is not None
+    active_provider = load_memory_config_provider()
+    vault_local_only = active_provider == "vault"
     vector_ready = vector_url_reachable if cfg_url else True
     ready_for_shadow = (
-        all(deps.values())
+        not vault_local_only
+        and all(deps.values())
         and mem0_json.exists()
         and (not ollama["required"] or ollama["ready"])
         and vector_ready
     )
-    active_provider = load_memory_config_provider()
     return {
         "deps": deps,
         "mem0_json_exists": mem0_json.exists(),
@@ -1905,8 +1948,9 @@ def mem0_readiness() -> dict[str, Any]:
         "vector_path_size_bytes": directory_size(vector_path) if vector_path else 0,
         "ollama": ollama,
         "active_memory_provider": active_provider or "(built-in only)",
+        "vault_local_only": vault_local_only,
         "ready_for_shadow": ready_for_shadow,
-        "ready_for_production": ready_for_shadow and active_provider in {"mem0", "vault"},
+        "ready_for_production": vault_local_only or (ready_for_shadow and active_provider == "mem0"),
     }
 
 
@@ -1988,13 +2032,14 @@ def audit(write_report: bool = True) -> dict[str, Any]:
         "duplicate_candidates": duplicate_candidates(records),
         "mem0": mem0_readiness(),
         "vault_database": database_health(),
+        "local_index": local_index_health(records),
         "recommendations": [],
     }
     if core_chars["MEMORY.md"] > 4800:
         payload["recommendations"].append("MEMORY.md is above 80% of the 6000-char target; move archive_candidate entries to the vault.")
     if by_policy.get("archive_candidate", 0):
         payload["recommendations"].append(f"{by_policy['archive_candidate']} active vault records are archive candidates and should not grow Core.")
-    if not payload["mem0"]["ready_for_shadow"]:
+    if not payload["mem0"]["ready_for_shadow"] and not payload["mem0"].get("vault_local_only"):
         missing = []
         deps = payload["mem0"].get("deps", {})
         if not all(deps.values()):
@@ -2010,6 +2055,19 @@ def audit(write_report: bool = True) -> dict[str, Any]:
         payload["recommendations"].append(f"mem0 OSS is not ready for shadow indexing; {detail}.")
     if not payload["vault_database"].get("healthy"):
         payload["recommendations"].append("Vault database integrity, event chain, or index outbox needs attention.")
+    embedding_status = str(
+        payload["local_index"].get("embedding_status", "unknown")
+    )
+    if (
+        active
+        and not payload["local_index"].get("semantic_ready")
+        and not embedding_status.startswith("disabled:")
+    ):
+        payload["recommendations"].append(
+            "Vault semantic retrieval is degraded to lexical-only; "
+            f"embedding_status={embedding_status} "
+            f"vectors={payload['local_index'].get('vector_records', 0)}/{len(active)}."
+        )
 
     if write_report:
         REPORT_DIR.mkdir(parents=True, exist_ok=True)
@@ -2024,8 +2082,8 @@ def audit(write_report: bool = True) -> dict[str, Any]:
             f"- MEMORY.md: {core_chars['MEMORY.md']}/6000 chars",
             f"- USER.md: {core_chars['USER.md']}/3000 chars",
             f"- Duplicate candidates: {len(payload['duplicate_candidates'])}",
-            f"- mem0 ready for shadow: {payload['mem0']['ready_for_shadow']}",
-            f"- mem0 vector mode: {payload['mem0'].get('vector_mode', 'unknown')}",
+            f"- production retrieval: {payload['local_index'].get('mode', 'lexical-only')}",
+            f"- embedding status: {payload['local_index'].get('embedding_status', 'unknown')}",
             "",
             "## Topics",
             "",
@@ -2051,55 +2109,13 @@ def audit(write_report: bool = True) -> dict[str, Any]:
 
 
 def observe(write_report: bool = True) -> dict[str, Any]:
-    outbox = sync_index_outbox(dry_run=False)
-    sync = outbox.get("sync") or {
-        "added": 0, "updated": 0, "unchanged": 0, "deleted_duplicates": 0,
-        "deleted_stale": 0, "errors": list(outbox.get("errors", [])),
-    }
-    payload = audit(write_report=False)
-    payload["mem0_sync"] = sync
-    payload["index_outbox"] = outbox
-    if sync.get("errors"):
-        payload["recommendations"].append("mem0 shadow sync reported errors; inspect mem0_sync in the JSON report.")
+    """Compatibility entry point for the retired shadow-observe job.
 
-    if write_report:
-        REPORT_DIR.mkdir(parents=True, exist_ok=True)
-        stamp = dt.datetime.now().strftime("%Y%m%d-%H%M%S")
-        json_path = REPORT_DIR / f"{stamp}.json"
-        md_path = REPORT_DIR / f"{stamp}.md"
-        json_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True) + "\n", encoding="utf-8")
-        sync_line = (
-            f"- mem0 sync: added={sync.get('added', 0)}, updated={sync.get('updated', 0)}, "
-            f"unchanged={sync.get('unchanged', 0)}, deleted_duplicates={sync.get('deleted_duplicates', 0)}, "
-            f"errors={len(sync.get('errors', []))}"
-        )
-        lines = [
-            f"# Hermes Memory Observation - {stamp}",
-            "",
-            f"- Active records: {payload['active_count']}",
-            f"- MEMORY.md: {payload['core_chars']['MEMORY.md']}/6000 chars",
-            f"- USER.md: {payload['core_chars']['USER.md']}/3000 chars",
-            f"- Duplicate candidates: {len(payload['duplicate_candidates'])}",
-            f"- mem0 ready for shadow: {payload['mem0']['ready_for_shadow']}",
-            f"- active memory provider: {payload['mem0']['active_memory_provider']}",
-            f"- mem0 vector mode: {payload['mem0'].get('vector_mode', 'unknown')}",
-            f"- mem0 vector url: {payload['mem0'].get('vector_url', '') or '(none)'}",
-            sync_line,
-            "",
-            "## Topics",
-            "",
-        ]
-        for topic, count in sorted(payload["topics"].items()):
-            lines.append(f"- {topic}: {count}")
-        lines.extend(["", "## Recommendations", ""])
-        if payload["recommendations"]:
-            lines.extend(f"- {item}" for item in payload["recommendations"])
-        else:
-            lines.append("- None.")
-        md_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
-        payload["report_md"] = str(md_path)
-        payload["report_json"] = str(json_path)
-    return payload
+    Observation is now a local audit only.  Keeping this callable avoids
+    breaking older operator commands while ensuring it cannot wake mem0 or
+    Qdrant after the external index has been retired.
+    """
+    return audit(write_report=write_report)
 
 
 def print_records(topic: str | None = None) -> None:
@@ -2142,7 +2158,7 @@ def main(argv: list[str] | None = None) -> int:
     sub.add_parser("import-core", help="Import MEMORY.md and USER.md into the vault.")
     audit_p = sub.add_parser("audit", help="Write a memory audit report.")
     audit_p.add_argument("--json", action="store_true", help="Print JSON payload.")
-    observe_p = sub.add_parser("observe", help="Sync mem0 shadow index and write a memory observation report.")
+    observe_p = sub.add_parser("observe", help="Run a local Vault audit (legacy command name).")
     observe_p.add_argument("--json", action="store_true", help="Print JSON payload.")
     list_p = sub.add_parser("list", help="List active vault records.")
     list_p.add_argument("--topic", default="", help="Filter by topic.")
@@ -2157,7 +2173,7 @@ def main(argv: list[str] | None = None) -> int:
     promote_p = sub.add_parser("promote", help="Promote a pending candidate to active memory.")
     promote_p.add_argument("id")
     promote_p.add_argument("--reason", default="promote candidate")
-    promote_p.add_argument("--no-sync", action="store_true", help="Do not immediately sync the promotion to mem0.")
+    promote_p.add_argument("--no-sync", action="store_true", help="Retained for compatibility; Vault writes are local-only.")
     reject_p = sub.add_parser("reject", help="Reject a pending candidate.")
     reject_p.add_argument("id")
     reject_p.add_argument("--reason", default="reject candidate")
@@ -2165,34 +2181,34 @@ def main(argv: list[str] | None = None) -> int:
     merge_p.add_argument("candidate_id")
     merge_p.add_argument("active_id")
     merge_p.add_argument("--reason", default="merge candidate into active memory")
-    merge_p.add_argument("--no-sync", action="store_true", help="Do not immediately sync the merge to mem0.")
+    merge_p.add_argument("--no-sync", action="store_true", help="Retained for compatibility; Vault writes are local-only.")
     rollback_p = sub.add_parser("rollback", help="Rollback a history entry by history_id.")
     rollback_p.add_argument("history_id")
     rollback_p.add_argument("--reason", default="rollback")
-    rollback_p.add_argument("--no-sync", action="store_true", help="Do not immediately sync the rollback to mem0.")
+    rollback_p.add_argument("--no-sync", action="store_true", help="Retained for compatibility; Vault writes are local-only.")
     add_p = sub.add_parser("add", help="Add a durable memory to the local authority vault.")
     add_p.add_argument("--body", default="", help="Memory body text.")
     add_p.add_argument("--body-file", default="", help="Read memory body from a UTF-8 file.")
     add_p.add_argument("--title", default="", help="Optional title.")
     add_p.add_argument("--topic", default="", choices=sorted(TOPIC_LABELS), help="Optional topic.")
     add_p.add_argument("--tag", action="append", default=[], help="Optional tag; repeat or comma-separate.")
-    add_p.add_argument("--no-sync", action="store_true", help="Do not immediately sync the new record to mem0.")
+    add_p.add_argument("--no-sync", action="store_true", help="Retained for compatibility; Vault writes are local-only.")
     update_p = sub.add_parser("update", help="Update a record by id and preserve old content in history.")
     update_p.add_argument("id")
     update_p.add_argument("--body", default="")
     update_p.add_argument("--body-file", default="")
     update_p.add_argument("--title", default="")
     update_p.add_argument("--topic", default="")
-    update_p.add_argument("--no-sync", action="store_true", help="Do not immediately sync the update to mem0.")
+    update_p.add_argument("--no-sync", action="store_true", help="Retained for compatibility; Vault writes are local-only.")
     status_p = sub.add_parser("status", help="Set record status.")
     status_p.add_argument("id")
     status_p.add_argument("status")
-    status_p.add_argument("--no-sync", action="store_true", help="Do not immediately sync the status change to mem0.")
+    status_p.add_argument("--no-sync", action="store_true", help="Retained for compatibility; Vault writes are local-only.")
     sub.add_parser("export-mem0", help="Regenerate mem0 seed JSONL from active records.")
-    sync_p = sub.add_parser("sync-mem0", help="Sync active vault records into mem0 shadow index.")
+    sync_p = sub.add_parser("sync-mem0", help="Retired compatibility command; external indexing is disabled.")
     sync_p.add_argument("--dry-run", action="store_true", help="Show sync scope without touching mem0.")
     sync_p.add_argument("--limit", type=int, default=0, help="Limit records for a test sync.")
-    outbox_p = sub.add_parser("sync-index", help="Replay queued vault changes to the derived mem0/Qdrant index.")
+    outbox_p = sub.add_parser("sync-index", help="Retired compatibility command; external indexing is disabled.")
     outbox_p.add_argument("--dry-run", action="store_true", help="Show queued work without touching the index.")
 
     args = parser.parse_args(argv)
@@ -2210,13 +2226,11 @@ def main(argv: list[str] | None = None) -> int:
         else:
             print(f"Memory audit written: {payload.get('report_md')}")
     elif args.cmd == "observe":
-        payload = observe(write_report=True)
+        payload = audit(write_report=True)
         if args.json:
             print(json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True))
         else:
-            print(f"Memory observation written: {payload.get('report_md')}")
-        if payload.get("mem0_sync", {}).get("errors"):
-            return 1
+            print(f"Memory audit written: {payload.get('report_md')}")
     elif args.cmd == "list":
         print_records(args.topic or None)
     elif args.cmd == "propose":
@@ -2243,30 +2257,15 @@ def main(argv: list[str] | None = None) -> int:
     elif args.cmd == "promote":
         record = promote_record(args.id, reason=args.reason)
         print(f"Promoted {record['id']}: {record.get('title', '')}")
-        if not args.no_sync:
-            summary = sync_mem0()
-            print(json.dumps(summary, ensure_ascii=False, indent=2, sort_keys=True))
-            if summary.get("errors"):
-                return 1
     elif args.cmd == "reject":
         record = reject_record(args.id, reason=args.reason)
         print(f"Rejected {record['id']}: {record.get('title', '')}")
     elif args.cmd == "merge":
         record = merge_record(args.candidate_id, args.active_id, reason=args.reason)
         print(f"Merged {args.candidate_id} over {args.active_id}: active={record['id']}")
-        if not args.no_sync:
-            summary = sync_mem0()
-            print(json.dumps(summary, ensure_ascii=False, indent=2, sort_keys=True))
-            if summary.get("errors"):
-                return 1
     elif args.cmd == "rollback":
         entry = rollback_history(args.history_id, reason=args.reason)
         print(f"Rolled back {args.history_id}: {entry['history_id']}")
-        if not args.no_sync:
-            summary = sync_mem0()
-            print(json.dumps(summary, ensure_ascii=False, indent=2, sort_keys=True))
-            if summary.get("errors"):
-                return 1
     elif args.cmd == "add":
         body = args.body
         if args.body_file:
@@ -2281,11 +2280,6 @@ def main(argv: list[str] | None = None) -> int:
         )
         verb = "Added" if added else "Already exists"
         print(f"{verb} {record['id']}: {record.get('title', '')}")
-        if not args.no_sync:
-            summary = sync_mem0()
-            print(json.dumps(summary, ensure_ascii=False, indent=2, sort_keys=True))
-            if summary.get("errors"):
-                return 1
     elif args.cmd == "update":
         body = args.body
         if args.body_file:
@@ -2294,34 +2288,20 @@ def main(argv: list[str] | None = None) -> int:
             raise SystemExit("Provide --body or --body-file")
         update_record(args.id, body.strip(), title=args.title or None, topic=args.topic or None)
         print(f"Updated {args.id}")
-        if not args.no_sync:
-            summary = sync_mem0()
-            print(json.dumps(summary, ensure_ascii=False, indent=2, sort_keys=True))
-            if summary.get("errors"):
-                return 1
     elif args.cmd == "status":
         set_status(args.id, args.status)
         print(f"Set {args.id} status={args.status}")
-        if not args.no_sync:
-            summary = sync_mem0()
-            print(json.dumps(summary, ensure_ascii=False, indent=2, sort_keys=True))
-            if summary.get("errors"):
-                return 1
     elif args.cmd == "export-mem0":
         ensure_layout()
         records = read_jsonl(RECORDS_PATH)
         write_mem0_seed(records)
         print(f"Wrote {MEM0_SEED_PATH}")
     elif args.cmd == "sync-mem0":
-        summary = sync_mem0(dry_run=args.dry_run, limit=max(0, args.limit))
-        print(json.dumps(summary, ensure_ascii=False, indent=2, sort_keys=True))
-        if summary.get("errors"):
-            return 1
+        print("External mem0/Qdrant indexing is retired; Vault is local-only. No action taken.")
+        return 2
     elif args.cmd == "sync-index":
-        summary = sync_index_outbox(dry_run=args.dry_run)
-        print(json.dumps(summary, ensure_ascii=False, indent=2, sort_keys=True))
-        if summary.get("errors"):
-            return 1
+        print("External mem0/Qdrant index replay is retired; Vault is local-only. No action taken.")
+        return 2
     return 0
 
 

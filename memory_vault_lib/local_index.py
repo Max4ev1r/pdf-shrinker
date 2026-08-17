@@ -14,10 +14,11 @@ from pathlib import Path
 from typing import Any, Callable, ContextManager, Sequence
 
 
-SEMANTIC_RELEVANCE_MIN = 0.58
-SEMANTIC_RELATIVE_MIN = 0.85
+SEMANTIC_RELEVANCE_MIN = 0.64
+SEMANTIC_RELATIVE_MIN = 0.89
 HYBRID_SEMANTIC_MIN = 0.46
 HYBRID_LEXICAL_RATIO_MIN = 0.25
+LOCAL_EMBEDDING_BATCH_SIZE = 8
 
 
 class LocalSearchIndex:
@@ -151,7 +152,8 @@ class LocalSearchIndex:
             if active:
                 try:
                     vectors = self.embedder_factory().embed(
-                        [self.embedding_text(record) for record in active]
+                        [self.embedding_text(record) for record in active],
+                        batch_size=LOCAL_EMBEDDING_BATCH_SIZE,
                     )
                     vector_rows = []
                     for record, values in zip(active, vectors):
@@ -172,6 +174,8 @@ class LocalSearchIndex:
                         vector_rows,
                     )
                     embedding_status = "ready"
+                except ModuleNotFoundError:
+                    embedding_status = "disabled:dependency-not-installed"
                 except Exception as exc:
                     embedding_status = f"unavailable:{type(exc).__name__}"
             metadata = {
@@ -222,6 +226,78 @@ class LocalSearchIndex:
         self.rebuild(records)
         return True
 
+    def health(self, records: list[dict[str, Any]]) -> dict[str, Any]:
+        """Report lexical and semantic index readiness against authority data."""
+        active_count = sum(
+            1 for record in records if record.get("status") == "active"
+        )
+        result: dict[str, Any] = {
+            "integrity": "missing",
+            "active_records": active_count,
+            "indexed_records": 0,
+            "vector_records": 0,
+            "embedding_model": "",
+            "embedding_status": "unknown",
+            "fingerprint_matches": False,
+            "index_ready": False,
+            "semantic_ready": False,
+            "mode": "lexical-only",
+            "error": "",
+        }
+        try:
+            with sqlite3.connect(
+                f"file:{self.path}?mode=ro",
+                uri=True,
+            ) as conn:
+                result["integrity"] = str(
+                    conn.execute("PRAGMA integrity_check").fetchone()[0]
+                )
+                result["indexed_records"] = int(
+                    conn.execute("SELECT COUNT(*) FROM memories").fetchone()[0]
+                )
+                result["vector_records"] = int(
+                    conn.execute(
+                        "SELECT COUNT(*) FROM memory_vectors"
+                    ).fetchone()[0]
+                )
+                metadata = dict(
+                    conn.execute(
+                        "SELECT key,value FROM index_meta"
+                    ).fetchall()
+                )
+        except (OSError, sqlite3.Error) as exc:
+            result["error"] = f"{type(exc).__name__}: {exc}"
+            return result
+
+        result["embedding_model"] = metadata.get("embedding_model", "")
+        result["embedding_status"] = metadata.get(
+            "embedding_status", "unknown"
+        )
+        result["fingerprint_matches"] = (
+            metadata.get("records_fingerprint")
+            == self.active_records_fingerprint(records)
+        )
+        result["index_ready"] = bool(
+            result["integrity"] == "ok"
+            and metadata.get("schema_version") == str(self.schema_version)
+            and result["fingerprint_matches"]
+            and result["indexed_records"] == active_count
+        )
+        result["semantic_ready"] = bool(
+            result["index_ready"]
+            and (
+                active_count == 0
+                or (
+                    result["embedding_status"] == "ready"
+                    and result["embedding_model"] == self.embedding_model
+                    and result["vector_records"] == active_count
+                )
+            )
+        )
+        if result["semantic_ready"]:
+            result["mode"] = "local-hybrid"
+        return result
+
     def fts_search(
         self,
         conn: sqlite3.Connection,
@@ -238,6 +314,7 @@ class LocalSearchIndex:
         rows = conn.execute(
             """
             SELECT m.id,m.topic,m.title,m.summary,m.body,m.tags,m.updated_at,
+                   m.search_tokens,
                    bm25(
                        memories_fts,0.0,8.0,4.0,1.0,1.5,1.5,2.0
                    ) AS rank
@@ -251,9 +328,45 @@ class LocalSearchIndex:
         ).fetchall()
         columns = (
             "id", "topic", "title", "summary", "body", "tags",
-            "updated_at", "rank",
+            "updated_at", "search_tokens", "rank",
         )
         return [dict(zip(columns, row)) for row in rows]
+
+    def lexical_match_is_relevant(
+        self,
+        query: str,
+        record: dict[str, Any],
+    ) -> bool:
+        """Require multiple lexical signals when semantic search is absent.
+
+        FTS uses an OR expression so that natural phrasing can still find a
+        durable fact, but one shared place name, number, or generic word is not
+        enough evidence to inject memory into an unrelated turn.
+        """
+        query_terms = {
+            term for term in self.search_terms(query)
+            if not term.isdigit()
+        }
+        raw_text = " ".join(
+            str(record.get(field, ""))
+            for field in ("title", "summary", "body", "tags", "topic")
+        ).lower()
+        indexed_terms = set(
+            str(record.get("search_tokens", "")).lower().split()
+        )
+        indexed_terms.update(self.search_terms(raw_text))
+        overlap = query_terms & indexed_terms
+        if len(overlap) >= 3:
+            return True
+
+        for term in query_terms:
+            if term not in raw_text:
+                continue
+            if re.fullmatch(r"[a-z0-9_./~-]{4,}", term):
+                return True
+            if len(term) >= 3 and re.fullmatch(r"[\u4e00-\u9fff]+", term):
+                return True
+        return False
 
     def vector_search(
         self,
@@ -377,12 +490,13 @@ class LocalSearchIndex:
                     and lexical_strength / best_lexical_strength
                     >= HYBRID_LEXICAL_RATIO_MIN
                 )
-                # Local embeddings are optional.  When the embedding backend
-                # is unavailable, an exact/keyword FTS hit is still durable
-                # evidence and must not be discarded solely because no vector
-                # row can corroborate it.  Keep the stricter hybrid gate when
-                # semantic candidates are present.
-                lexical_only = not semantic and record_id in lexical_by_id
+                lexical_only = (
+                    not semantic
+                    and record_id in lexical_by_id
+                    and self.lexical_match_is_relevant(
+                        query, lexical_by_id[record_id]
+                    )
+                )
                 if not (strong_semantic or corroborated or lexical_only):
                     continue
                 scores[record_id] = (

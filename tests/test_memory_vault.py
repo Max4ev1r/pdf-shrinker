@@ -6,6 +6,7 @@ import os
 import sqlite3
 import subprocess
 import sys
+import types
 import uuid
 from pathlib import Path
 
@@ -42,7 +43,7 @@ class FakeEmbedder:
             1.0 + len(lowered) % 7,
         ]
 
-    def embed(self, texts):
+    def embed(self, texts, **kwargs):
         return iter(self._vector(text) for text in texts)
 
     def query_embed(self, texts):
@@ -311,7 +312,19 @@ def test_outbox_job_reconciles_even_without_pending_events(
     assert result["reconciled"] is True
 
 
-def test_active_vault_provider_reports_production_index_ready(vault):
+def test_vault_writes_do_not_enqueue_retired_external_index(vault):
+    record, created = vault.add_record("本地 Vault 写入不应进入外部索引队列", topic="other")
+
+    assert created
+    with sqlite3.connect(vault.VAULT_DB_PATH) as conn:
+        queued = conn.execute(
+            "SELECT COUNT(*) FROM index_outbox WHERE record_id = ?",
+            (record["id"],),
+        ).fetchone()[0]
+    assert queued == 0
+
+
+def test_active_vault_provider_does_not_require_retired_shadow(vault):
     (vault.HERMES_HOME / "config.yaml").write_text(
         "memory:\n  provider: vault\n",
         encoding="utf-8",
@@ -324,7 +337,8 @@ def test_active_vault_provider_reports_production_index_ready(vault):
     readiness = vault.mem0_readiness()
 
     assert readiness["active_memory_provider"] == "vault"
-    assert readiness["ready_for_shadow"] is True
+    assert readiness["vault_local_only"] is True
+    assert readiness["ready_for_shadow"] is False
     assert readiness["ready_for_production"] is True
 
 
@@ -336,6 +350,25 @@ def test_fts_aliases_find_home_assistant_from_natural_chinese(vault):
     vault.add_record("用户喜欢蓝色界面", topic="other")
 
     results = vault.local_search("家里的冷气要通过哪个脚本调温？", top_k=3)
+
+    assert results
+    assert results[0]["id"] == expected["id"]
+
+
+def test_fts_vehicle_aliases_recall_car_from_natural_chinese(
+    vault,
+    monkeypatch,
+):
+    def unavailable():
+        raise ModuleNotFoundError("fastembed")
+
+    monkeypatch.setattr(vault, "get_local_embedder", unavailable)
+    expected, _ = vault.add_record(
+        "用户目前驾驶特斯拉 Model Y。",
+        topic="products",
+    )
+
+    results = vault.local_search("我平时开什么车？", top_k=3)
 
     assert results
     assert results[0]["id"] == expected["id"]
@@ -386,11 +419,93 @@ def test_local_search_keeps_lexical_hits_when_embeddings_are_unavailable(
     sqlite3.connect(vault.LOCAL_INDEX_PATH).close()
     monkeypatch.setattr(manager, "ensure", lambda records: False)
     monkeypatch.setattr(manager, "fts_search", lambda conn, query, top_k: [
-        {"id": "exact", "title": "exact", "updated_at": "2026", "rank": -4.0},
+        {
+            "id": "exact",
+            "title": "query preference",
+            "search_tokens": "query preference",
+            "updated_at": "2026",
+            "rank": -4.0,
+        },
     ])
     monkeypatch.setattr(manager, "vector_search", lambda conn, query, top_k: [])
 
     assert [row["id"] for row in manager.search([], "query", top_k=10)] == ["exact"]
+
+
+def test_local_search_rejects_single_weak_lexical_overlap(
+    vault,
+    monkeypatch,
+):
+    manager = vault._local_index_manager()
+    sqlite3.connect(vault.LOCAL_INDEX_PATH).close()
+    monkeypatch.setattr(manager, "ensure", lambda records: False)
+    monkeypatch.setattr(manager, "fts_search", lambda conn, query, top_k: [{
+        "id": "location",
+        "title": "用户常住无锡",
+        "summary": "用户常住无锡",
+        "body": "用户常住无锡",
+        "search_tokens": "无锡",
+        "updated_at": "2026",
+        "rank": -4.0,
+    }])
+    monkeypatch.setattr(manager, "vector_search", lambda conn, query, top_k: [])
+
+    assert manager.search([], "无锡今天会下雨吗？", top_k=10) == []
+
+
+def test_local_search_keeps_specific_lexical_fact_without_embeddings(
+    vault,
+    monkeypatch,
+):
+    manager = vault._local_index_manager()
+    sqlite3.connect(vault.LOCAL_INDEX_PATH).close()
+    monkeypatch.setattr(manager, "ensure", lambda records: False)
+    monkeypatch.setattr(manager, "fts_search", lambda conn, query, top_k: [{
+        "id": "health",
+        "title": "高血压病史",
+        "summary": "用户有高血压病史",
+        "body": "用户有高血压病史",
+        "search_tokens": "高血压 高血 血压",
+        "updated_at": "2026",
+        "rank": -8.0,
+    }])
+    monkeypatch.setattr(manager, "vector_search", lambda conn, query, top_k: [])
+
+    results = manager.search([], "我的高血压记录", top_k=10)
+
+    assert [row["id"] for row in results] == ["health"]
+
+
+def test_local_index_health_reports_real_retrieval_mode(vault, monkeypatch):
+    real_find_spec = vault.importlib.util.find_spec
+    monkeypatch.setattr(
+        vault.importlib.util,
+        "find_spec",
+        lambda name: object() if name == "fastembed" else real_find_spec(name),
+    )
+    vault.add_record("用户长期驾驶特斯拉", topic="other")
+
+    ready = vault.local_index_health()
+
+    assert ready["index_ready"] is True
+    assert ready["semantic_ready"] is True
+    assert ready["mode"] == "local-hybrid"
+    assert ready["vector_records"] == ready["active_records"] == 1
+
+    def unavailable():
+        raise ModuleNotFoundError("fastembed")
+
+    monkeypatch.setattr(vault, "get_local_embedder", unavailable)
+    vault.rebuild_local_index(vault.read_jsonl(vault.RECORDS_PATH))
+
+    degraded = vault.local_index_health()
+
+    assert degraded["index_ready"] is True
+    assert degraded["semantic_ready"] is False
+    assert degraded["mode"] == "lexical-only"
+    assert degraded["embedding_status"] == "disabled:dependency-not-installed"
+    assert degraded["vector_records"] == 0
+    assert vault.local_search_mode() == "lexical-only"
 
 
 def test_local_index_rebuild_is_safe_across_processes(vault, tmp_path: Path):
@@ -404,7 +519,7 @@ import sys
 import uuid
 
 class Fake:
-    def embed(self, texts):
+    def embed(self, texts, **kwargs):
         return iter([1.0, 0.0, 0.0, 1.0] for _ in texts)
 
 spec = importlib.util.spec_from_file_location("_worker_" + uuid.uuid4().hex, {str(VAULT_SOURCE)!r})
@@ -448,12 +563,12 @@ def test_local_embedder_uses_durable_hermes_cache(vault, monkeypatch):
     calls = []
 
     class Embedder:
-        def __init__(self, *, model_name, cache_dir):
-            calls.append((model_name, cache_dir))
+        def __init__(self, *, model_name, cache_dir, threads):
+            calls.append((model_name, cache_dir, threads))
 
-    import fastembed
-
-    monkeypatch.setattr(fastembed, "TextEmbedding", Embedder)
+    fastembed = types.ModuleType("fastembed")
+    fastembed.TextEmbedding = Embedder
+    monkeypatch.setitem(sys.modules, "fastembed", fastembed)
     vault._LOCAL_EMBEDDER = None
 
     embedder = vault._real_get_local_embedder()
@@ -462,6 +577,7 @@ def test_local_embedder_uses_durable_hermes_cache(vault, monkeypatch):
     assert calls == [(
         vault.LOCAL_EMBEDDING_MODEL,
         str(vault.HERMES_HOME / "cache" / "fastembed"),
+        1,
     )]
 
 
@@ -590,6 +706,134 @@ def test_retrieval_eval_requires_negative_queries_to_abstain():
         assert not result["passed"]
         assert not result["content_passed"]
         assert not result["precision_passed"]
+    finally:
+        sys.modules.pop(name, None)
+
+
+def test_self_heal_resolves_gateway_interpreter_from_launchd(
+    tmp_path,
+    monkeypatch,
+):
+    name, self_heal = load_self_heal_module()
+    try:
+        interpreter = tmp_path / "gateway-python"
+        interpreter.touch()
+        plist = tmp_path / "ai.hermes.gateway.plist"
+        with plist.open("wb") as handle:
+            self_heal.plistlib.dump({
+                "ProgramArguments": [
+                    str(interpreter), "-m", "hermes_cli.main", "gateway",
+                ],
+            }, handle)
+        monkeypatch.setattr(self_heal, "GATEWAY_PLIST", plist)
+
+        assert self_heal.gateway_python() == interpreter
+    finally:
+        sys.modules.pop(name, None)
+
+
+def test_self_heal_reports_fresh_retrieval_failure_as_evaluation_failure(
+    tmp_path,
+    monkeypatch,
+):
+    name, self_heal = load_self_heal_module()
+    try:
+        monkeypatch.setattr(self_heal, "HERMES_HOME", tmp_path)
+        report_dir = tmp_path / "reports" / "memory-retrieval"
+        report_dir.mkdir(parents=True)
+        report = report_dir / "20260814-120000.md"
+        report.write_text("# failed\n", encoding="utf-8")
+        report.with_suffix(".json").write_text(
+            json.dumps({
+                "passed": False,
+                "passed_count": 14,
+                "case_count": 15,
+                "backend_passed_count": 3,
+                "backend_count": 3,
+                "latency_p95_ms": 9,
+                "interpreter": "/runtime/python",
+            }),
+            encoding="utf-8",
+        )
+        events = []
+
+        self_heal.maybe_run_report_script(
+            events,
+            "memory-retrieval",
+            "memory_retrieval_eval.py",
+            dry_run=False,
+        )
+
+        assert len(events) == 1
+        assert events[0].status == "evaluation_failed"
+        assert events[0].notify
+        assert "cases=14/15" in events[0].message
+    finally:
+        sys.modules.pop(name, None)
+
+
+def test_self_heal_runs_retrieval_eval_with_gateway_runtime(
+    tmp_path,
+    monkeypatch,
+):
+    name, self_heal = load_self_heal_module()
+    try:
+        scripts = tmp_path / "scripts"
+        scripts.mkdir()
+        eval_script = scripts / "memory_retrieval_eval.py"
+        eval_script.touch()
+        report_dir = tmp_path / "reports" / "memory-retrieval"
+        report_dir.mkdir(parents=True)
+        old_report = report_dir / "20260812-000000.md"
+        old_report.write_text("# stale\n", encoding="utf-8")
+        old_time = old_report.stat().st_mtime - 48 * 3600
+        os.utime(old_report, (old_time, old_time))
+        interpreter = tmp_path / "gateway-python"
+        interpreter.touch()
+        commands = []
+
+        def run_command(args, timeout):
+            commands.append((args, timeout))
+            fresh = report_dir / "20260814-130000.md"
+            fresh.write_text("# fresh failure\n", encoding="utf-8")
+            fresh.with_suffix(".json").write_text(
+                json.dumps({
+                    "passed": False,
+                    "passed_count": 14,
+                    "case_count": 15,
+                    "backend_passed_count": 3,
+                    "backend_count": 3,
+                    "latency_p95_ms": 8,
+                    "interpreter": str(interpreter),
+                }),
+                encoding="utf-8",
+            )
+            return 1, "fresh evaluation failed"
+
+        monkeypatch.setattr(self_heal, "HERMES_HOME", tmp_path)
+        monkeypatch.setattr(self_heal, "SCRIPTS_DIR", scripts)
+        monkeypatch.setattr(self_heal, "gateway_python", lambda: interpreter)
+        monkeypatch.setattr(self_heal, "run_command", run_command)
+        events = []
+
+        self_heal.maybe_run_report_script(
+            events,
+            "memory-retrieval",
+            "memory_retrieval_eval.py",
+            dry_run=False,
+        )
+
+        assert commands == [(
+            [
+                str(interpreter),
+                str(eval_script),
+                "--vault-home",
+                str(tmp_path),
+            ],
+            180,
+        )]
+        assert events[-1].status == "evaluation_failed"
+        assert "regenerate_failed" not in {event.status for event in events}
     finally:
         sys.modules.pop(name, None)
 
@@ -817,7 +1061,6 @@ def test_self_heal_dry_run_does_not_persist_state(
         monkeypatch.setattr(self_heal, "load_state", lambda: state)
         monkeypatch.setattr(self_heal, "memory_provider", lambda: "vault")
         for function_name in (
-            "check_hindsight",
             "check_telegram_gateway",
             "check_memory_config",
             "enforce_controlled_write_gates",
