@@ -1595,11 +1595,11 @@ def enhance_selected_with_llm(
     if focus_index is not None and returned_focus_index == focus_index:
         what = _safe_focus_text(parsed.get("what"), 80)
         why = _safe_focus_text(parsed.get("why"), 100)
-        if what and why:
+        if what:
             focus = {
                 "index": focus_index,
                 "what": what,
-                "why": why,
+                "why": why or "",
             }
 
     result = {
@@ -1924,10 +1924,13 @@ def render_message(
         "🌤 无锡天气\n" + weather_line(payload.get("weather", {})),
     ]
     if focus_item is not None:
+        focus_lines = ["发生了什么：" + (focus.get("what") or "")]
+        if focus.get("why"):
+            focus_lines.append("为什么值得关注：" + focus["why"])
         blocks.append(
             "🔥 今日重点\n"
-            f"发生了什么：{focus.get('what')}\n"
-            f"为什么值得关注：{focus.get('why')}{source_label(focus_item)}"
+            + "\n".join(focus_lines)
+            + source_label(focus_item)
         )
     blocks.extend([
         block("🇨🇳 国内要闻", domestic),
