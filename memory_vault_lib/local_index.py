@@ -482,6 +482,22 @@ class LocalSearchIndex:
                     and semantic_score / best_semantic_score
                     >= SEMANTIC_RELATIVE_MIN
                 )
+                # Require at least one non-digit query term to appear in the
+                # record's search tokens.  This prevents spurious FTS matches
+                # where the only overlap comes from digit tokens (e.g. "19"
+                # matching inside a date like "2026-08-19") from passing the
+                # corroborated filter alongside a weak vector score.
+                _query_terms_nd = {
+                    t for t in self.search_terms(query) if not t.isdigit()
+                }
+                _rec_tokens = set(
+                    str(lexical_by_id.get(
+                        record_id, {}
+                    ).get("search_tokens", "")).lower().split()
+                )
+                _has_meaningful_lexical = bool(
+                    _query_terms_nd & _rec_tokens
+                )
                 corroborated = (
                     record_id in lexical_by_id
                     and record_id in semantic_by_id
@@ -489,6 +505,7 @@ class LocalSearchIndex:
                     and best_lexical_strength > 0
                     and lexical_strength / best_lexical_strength
                     >= HYBRID_LEXICAL_RATIO_MIN
+                    and _has_meaningful_lexical
                 )
                 lexical_only = (
                     not semantic
