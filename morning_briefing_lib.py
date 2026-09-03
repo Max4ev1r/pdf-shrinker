@@ -16,6 +16,7 @@ import os
 import re
 import subprocess
 import sys
+import tempfile
 import time
 import urllib.error
 import urllib.parse
@@ -179,7 +180,7 @@ CLICKBAIT_RE = re.compile(
     r"拦不住了|震动金融圈|紧急开会|大胆预言|决战明夜|华尔街.*决战|"
     r"最智能.*登场"
 )
-RUMOR_RE = re.compile(r"^曝|消息称|传闻|网传|据曝|被曝|曝光")
+RUMOR_RE = re.compile(r"^曝|消息称|传闻|网传|据曝|被曝|曝光|推测|爆料|传言|据称|疑似")
 COMMERCE_RE = re.compile(r"国补|探新低|新低|立减|到手|券后|折|水箱版|上下水版|扫拖|洗地|米家|科沃斯|石头|ROMO")
 STALE_TOPIC_RE = re.compile(r"伊朗新任最高领袖|油价.*100美元|哈梅内伊之子.*最高领袖")
 WORLD_NOISE_RE = re.compile(r"^视频|^視頻|港股|A股|概念走强|机构称|欧元兑|反弹|储能概念|法拉利|纯电车|汽车制造商|迎战中国品牌|澳洲农民|鼠疫|腐烂|秘密隧道|非法劳工")
@@ -281,9 +282,25 @@ CATEGORY_THRESHOLDS = {
 }
 
 SECTION_MINIMUMS = {
-    "domestic": 0,
-    "world": 0,
-    "tech": 0,
+    # These are quality-gate minimums, not a quota. A section that has fewer
+    # than two eligible, recent candidates gets one targeted gap-fill query;
+    # the section may still remain sparse when the search results are weak.
+    "domestic": 2,
+    "world": 2,
+    "tech": 2,
+}
+
+SECTION_MIN_UNIQUE_SOURCES = {
+    "domestic": 2,
+    "world": 2,
+    "tech": 2,
+}
+
+GAP_FILL_QUERIES = {
+    "domestic": "中国 今日重要新闻 政策 经济",
+    "world": "全球 今日重要新闻 国际 政策 冲突 经济",
+    "tech": "今日 AI 科技 重要新闻 人工智能 芯片",
+    "weather": "无锡 今日天气 实时",
 }
 
 EXCLUSION_REASONS = {
@@ -293,7 +310,7 @@ EXCLUSION_REASONS = {
     "section_page", "malformed_title", "local_gov_mirror",
     "analysis_title", "recent_topic_repeat", "world_domestic_feature",
     "world_tech_feature", "domestic_foreign_only", "local_domestic_source",
-    "world_china_local", "domestic_local_weak", "unconfirmed",
+    "world_china_local", "domestic_local_weak",
     "invalid_url", "tech_promo", "other_region_local",
 }
 
@@ -352,25 +369,6 @@ SOURCES: list[Source] = [
     Source("Google 机器之心", "ai", f"https://news.google.com/rss/search?q={_q('site:jiqizhixin.com AI 大模型 芯片 when:2d')}&hl=zh-CN&gl=CN&ceid=CN:zh-Hans", priority=58),
     Source("Google 量子位", "ai", f"https://news.google.com/rss/search?q={_q('site:qbitai.com AI 大模型 芯片 when:2d')}&hl=zh-CN&gl=CN&ceid=CN:zh-Hans", priority=56),
 ]
-
-RECOVERY_RSS_SOURCES: dict[str, list[Source]] = {
-    "domestic": [
-        Source("Google 新华政策恢复", "domestic", f"https://news.google.com/rss/search?q={_q('site:news.cn 国务院 央行 财政 商务部 政策 发布 when:2d')}&hl=zh-CN&gl=CN&ceid=CN:zh-Hans", priority=62),
-        Source("Google 人民政策恢复", "domestic", f"https://news.google.com/rss/search?q={_q('site:people.com.cn 国务院 央行 财政 商务部 监管 发布 when:2d')}&hl=zh-CN&gl=CN&ceid=CN:zh-Hans", priority=60),
-        Source("Google 中新政策恢复", "domestic", f"https://news.google.com/rss/search?q={_q('site:chinanews.com.cn 国务院 央行 财政 商务部 中国经济 when:2d')}&hl=zh-CN&gl=CN&ceid=CN:zh-Hans", priority=58),
-        Source("Google 政府网恢复", "domestic", f"https://news.google.com/rss/search?q={_q('site:gov.cn 国务院 政策 发布 when:2d')}&hl=zh-CN&gl=CN&ceid=CN:zh-Hans", priority=56),
-    ],
-    "world": [
-        Source("Google BBC国际恢复", "world", f"https://news.google.com/rss/search?q={_q('site:bbc.com/zhongwen 国际 美国 欧洲 中东 when:2d')}&hl=zh-CN&gl=CN&ceid=CN:zh-Hans", priority=62),
-        Source("Google RFI国际恢复", "world", f"https://news.google.com/rss/search?q={_q('site:rfi.fr/cn 国际 美国 欧洲 中东 when:2d')}&hl=zh-CN&gl=CN&ceid=CN:zh-Hans", priority=58),
-        Source("Google 国际硬新闻恢复", "world", f"https://news.google.com/rss/search?q={_q('国际 冲突 制裁 停火 选举 中东 欧洲 美国 when:1d')}&hl=zh-CN&gl=CN&ceid=CN:zh-Hans", priority=52),
-    ],
-    "tech": [
-        Source("Google AI产业恢复", "ai", f"https://news.google.com/rss/search?q={_q('AI 芯片 半导体 大模型 OpenAI Anthropic when:1d')}&hl=zh-CN&gl=CN&ceid=CN:zh-Hans", priority=56),
-        Source("Google IT之家科技恢复", "domestic_tech", f"https://news.google.com/rss/search?q={_q('site:ithome.com AI 芯片 大模型 开源 when:2d')}&hl=zh-CN&gl=CN&ceid=CN:zh-Hans", priority=54),
-    ],
-}
-
 
 WEATHER_CODES = {
     0: "晴",
@@ -653,7 +651,7 @@ def is_focus_candidate(item: dict[str, Any]) -> bool:
         "consumer_tech", "tech_consumer", "tech_market_opinion", "search_candidate",
         "analysis_title", "recent_topic_repeat", "world_domestic_feature",
         "world_tech_feature", "domestic_foreign_only", "local_domestic_source",
-        "world_china_local", "domestic_local_weak", "unconfirmed",
+        "world_china_local", "domestic_local_weak",
     }
     if bad.intersection(set(item.get("score_reasons", []))):
         return False
@@ -765,83 +763,156 @@ def fetch_source(source: Source) -> tuple[Source, bool, list[dict[str, Any]], st
         return source, False, [], f"{type(exc).__name__}: {exc}"
 
 
-def fetch_hermes_search(query: str, category: str, limit: int = 6) -> tuple[bool, list[dict[str, Any]], str | None]:
-    python = HERMES_AGENT_DIR / ".venv" / "bin" / "python"
+def resolve_search_runtime_dir() -> Path:
+    """Resolve the runtime that owns the public ``web_search`` entry point.
+
+    The gateway may run from a versioned production worktree rather than the
+    checkout containing this helper. Reading the existing launcher keeps the
+    gap-fill caller aligned with that live runtime without changing the global
+    search configuration or importing a private provider.
+    """
+    launcher = Path.home() / ".local" / "bin" / "hermes"
+    try:
+        text = launcher.read_text(encoding="utf-8")
+        match = re.search(r'exec\s+["\'](?P<root>.+?)/\.venv/bin/hermes["\']', text)
+        if match:
+            runtime = Path(match.group("root")).expanduser()
+            if runtime.is_dir():
+                return runtime
+    except (OSError, UnicodeError):
+        pass
+    return HERMES_AGENT_DIR
+
+
+def canonical_search_source(section: str) -> Source:
+    category = "ai" if section == "tech" else section
+    query = GAP_FILL_QUERIES[section]
+    return Source(
+        f"canonical web_search {section}",
+        category,
+        f"web-search://{query}",
+        kind="search",
+        priority=50,
+    )
+
+
+def fetch_canonical_web_search(
+    query: str,
+    category: str,
+    limit: int = 8,
+) -> tuple[bool, list[dict[str, Any]], str | None]:
+    """Call Hermes' public web_search through the live SearXNG runtime.
+
+    A temporary Hermes home pins only this child process to ``searxng``. That
+    prevents an unrelated global backend or a user plugin from silently
+    becoming Morning Brief's fallback while leaving the user's configuration
+    untouched.
+    """
+    runtime_dir = resolve_search_runtime_dir()
+    python = runtime_dir / ".venv" / "bin" / "python"
     if not python.exists():
         python = Path(sys.executable)
-    plugin_dir = HERMES_HOME / "plugins"
-    searxng_url = os.environ.get("SEARXNG_URL", "").strip() or "http://127.0.0.1:8888"
+    if not runtime_dir.is_dir():
+        return False, [], f"search runtime not found: {runtime_dir}"
+
+    marker = "__HERMES_MORNING_SEARCH__"
     code = r"""
 import json
-import sys
 
-sys.path.insert(0, __AGENT_DIR__)
-sys.path.insert(0, __PLUGIN_DIR__)
-try:
-    from hermes_search.provider import HermesSearchWebProvider
-except ModuleNotFoundError:
-    from plugins.web.hermes_search.provider import HermesSearchWebProvider
+from tools.web_tools import _get_search_backend, web_search_tool
 
-provider = HermesSearchWebProvider()
-result = provider.search(__QUERY__, limit=__LIMIT__)
-print(json.dumps(result, ensure_ascii=False))
+backend = _get_search_backend()
+if backend != "searxng":
+    result = {"success": False, "error": f"unexpected search backend: {backend}"}
+else:
+    raw = web_search_tool(__QUERY__, limit=__LIMIT__)
+    try:
+        result = json.loads(raw)
+    except Exception as exc:
+        result = {"success": False, "error": f"invalid web_search response: {exc}"}
+print(__MARKER__ + json.dumps({"backend": backend, "result": result}, ensure_ascii=False))
 """
     code = (
         code
-        .replace("__AGENT_DIR__", json.dumps(str(HERMES_AGENT_DIR)))
-        .replace("__PLUGIN_DIR__", json.dumps(str(plugin_dir)))
         .replace("__QUERY__", json.dumps(query, ensure_ascii=False))
         .replace("__LIMIT__", str(int(limit)))
+        .replace("__MARKER__", json.dumps(marker))
     )
     env = os.environ.copy()
-    env.setdefault("HERMES_HOME", str(HERMES_HOME))
-    env.setdefault("SEARXNG_URL", searxng_url)
-    last_error = "search failed"
-    for attempt in range(2):
-        try:
+    env["SEARXNG_URL"] = os.environ.get("SEARXNG_URL", "").strip() or "http://127.0.0.1:8888"
+    env.pop("PYTHONPATH", None)
+    env.pop("PYTHONHOME", None)
+    try:
+        with tempfile.TemporaryDirectory(prefix="hermes-morning-search-") as temp_home:
+            temp_home_path = Path(temp_home)
+            (temp_home_path / "config.yaml").write_text(
+                "web:\n"
+                "  search_backend: searxng\n"
+                "  keyless_rescue: false\n"
+                "  keyless_fallback: false\n",
+                encoding="utf-8",
+            )
+            env["HERMES_HOME"] = str(temp_home_path)
             proc = subprocess.run(
                 [str(python), "-c", code],
-                cwd=str(HERMES_AGENT_DIR),
+                cwd=str(runtime_dir),
                 env=env,
                 text=True,
                 capture_output=True,
-                timeout=20,
+                timeout=25,
                 check=False,
             )
-            if proc.returncode != 0:
-                last_error = (proc.stderr or proc.stdout or f"exit {proc.returncode}")[:300]
-                continue
-            payload = json.loads(proc.stdout)
-            if not payload.get("success"):
-                last_error = str(payload.get("error") or "search failed")[:300]
-                continue
-            items = []
-            for hit in (payload.get("data") or {}).get("web") or []:
-                meta = hit.get("metadata") if isinstance(hit.get("metadata"), dict) else {}
-                url = hit.get("url") or ""
-                domain = meta.get("source_domain") or urllib.parse.urlsplit(url).netloc
-                items.append({
-                    "title": clean_text(hit.get("title") or ""),
-                    "url": url,
-                    "summary": clean_text(hit.get("description") or ""),
-                    "source": domain or "Hermes Search",
-                    "feed_source": "Hermes Search",
-                    "category": category,
-                    "published_at": parse_date(meta.get("published_date")) if meta.get("published_date") else None,
-                })
-            return bool(items), items, None if items else "no usable items"
-        except Exception as exc:
-            last_error = f"{type(exc).__name__}: {exc}"
-        if attempt == 0:
-            time.sleep(1)
-    return False, [], last_error
+    except Exception as exc:
+        return False, [], f"{type(exc).__name__}: {exc}"
 
+    if proc.returncode != 0:
+        return False, [], (proc.stderr or proc.stdout or f"exit {proc.returncode}")[:300]
+    line = next(
+        (line for line in reversed(proc.stdout.splitlines()) if line.startswith(marker)),
+        None,
+    )
+    if not line:
+        return False, [], "canonical web_search returned no structured response"
+    try:
+        envelope = json.loads(line[len(marker):])
+    except json.JSONDecodeError as exc:
+        return False, [], f"canonical web_search response parse failed: {exc}"
+    if envelope.get("backend") != "searxng":
+        return False, [], f"unexpected search backend: {envelope.get('backend')}"
+    response = envelope.get("result") or {}
+    if not response.get("success"):
+        return False, [], str(response.get("error") or "canonical web_search failed")[:300]
 
-def all_recovery_rss_sources() -> list[Source]:
-    out = []
-    for sources in RECOVERY_RSS_SOURCES.values():
-        out.extend(sources)
-    return out
+    items = []
+    for hit in (response.get("data") or {}).get("web") or []:
+        if not isinstance(hit, dict):
+            continue
+        title = clean_text(hit.get("title") or "")
+        url = canonical_url(clean_text(hit.get("url") or ""))
+        if not title or not valid_article_url(url):
+            continue
+        metadata = hit.get("metadata") if isinstance(hit.get("metadata"), dict) else {}
+        domain = clean_text(metadata.get("source_domain") or urlsplit(url).netloc).lower()
+        domain = domain.split("@")[-1].split(":", 1)[0].removeprefix("www.")
+        published_value = (
+            hit.get("published_at")
+            or hit.get("published_date")
+            or metadata.get("published_date")
+        )
+        items.append({
+            "title": title,
+            "url": url,
+            "summary": clean_text(hit.get("description") or "")[:220],
+            "source": domain or "SearXNG",
+            "feed_source": "canonical web_search",
+            "category": category,
+            "published_at": parse_date(str(published_value)) if published_value else None,
+            "fetched_at": now().isoformat(),
+            "search_backend": "searxng",
+            "search_gap_fill": True,
+            "search_query": query,
+        })
+    return bool(items), items, None if items else "no usable items"
 
 
 def build_ranked_categories(categories: dict[str, list[dict[str, Any]]]) -> dict[str, list[dict[str, Any]]]:
@@ -855,31 +926,56 @@ def selected_count_from_ranked(ranked: dict[str, list[dict[str, Any]]], section:
     return len(pick_items(ranked.get(section, []), 3, source_limit=source_limit))
 
 
+def _is_fresh_candidate(item: dict[str, Any]) -> bool:
+    published = item.get("published_at")
+    if not published:
+        return False
+    try:
+        dt = datetime.fromisoformat(str(published).replace("Z", "+00:00"))
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=TZ)
+    except (TypeError, ValueError):
+        return False
+    return now() - timedelta(hours=24) <= dt <= now() + timedelta(minutes=5)
+
+
+def section_gap_reasons(
+    ranked: dict[str, list[dict[str, Any]]],
+    section: str,
+) -> list[str]:
+    """Return quality-gate reasons for one targeted gap-fill query."""
+    selected = pick_items(
+        ranked.get(section, []),
+        SECTION_MAX_COUNT,
+        source_limit=3 if section == "world" else 2,
+    )
+    reasons: list[str] = []
+    if not ranked.get(section):
+        reasons.append("no_ranked_candidates")
+    elif not selected:
+        reasons.append("zero_high_quality")
+    if len(selected) < SECTION_MINIMUMS.get(section, 0):
+        reasons.append("insufficient_quality")
+    unique_sources = {
+        item.get("display_source") or normalized_source(item)
+        for item in selected
+    }
+    if selected and len(unique_sources) < SECTION_MIN_UNIQUE_SOURCES.get(section, 1):
+        reasons.append("insufficient_diversity")
+    if selected and not any(_is_fresh_candidate(item) for item in selected):
+        reasons.append("freshness_gap")
+    return reasons
+
+
 def thin_sections_from_ranked(ranked: dict[str, list[dict[str, Any]]]) -> list[str]:
     return [
         section
-        for section, minimum in SECTION_MINIMUMS.items()
-        if selected_count_from_ranked(ranked, section) < minimum
+        for section in SECTION_MINIMUMS
+        if section_gap_reasons(ranked, section)
     ]
 
 
-def fetch_recovery_rss_sources(
-    sources: list[Source],
-    state: dict[str, Any],
-    categories: dict[str, list[dict[str, Any]]],
-) -> None:
-    if not sources:
-        return
-    with concurrent.futures.ThreadPoolExecutor(max_workers=min(len(sources), 6)) as pool:
-        futures = [pool.submit(fetch_source, src) for src in sources]
-        for fut in concurrent.futures.as_completed(futures):
-            source, ok, items, error = fut.result()
-            update_source_health(state, source, ok, len(items), error)
-            if ok:
-                categories[source.category].extend(items)
-
-
-def collect_news() -> tuple[dict[str, list[dict[str, Any]]], dict[str, Any]]:
+def collect_news() -> tuple[dict[str, list[dict[str, Any]]], dict[str, Any], dict[str, Any]]:
     state = read_json(STATE_FILE, {})
     categories = {"domestic": [], "domestic_tech": [], "world": [], "ai": []}
     ranked = sorted(SOURCES, key=lambda s: score_source(s, state), reverse=True)
@@ -890,68 +986,59 @@ def collect_news() -> tuple[dict[str, list[dict[str, Any]]], dict[str, Any]]:
             update_source_health(state, source, ok, len(items), error)
             if ok:
                 categories[source.category].extend(items)
-    search_sources = [
-        Source("Hermes Search 国内", "domestic", "hermes-search://中国 国务院 政策 经济 今日 新闻", priority=55),
-        Source("Hermes Search 国际", "world", "hermes-search://US Europe Middle East international latest news", priority=55),
-        Source("Hermes Search AI", "ai", "hermes-search://AI OpenAI Anthropic DeepMind latest news", priority=55),
-    ]
-    for src in search_sources:
-        if score_source(src, state) < 0:
-            continue
-        query = src.url.removeprefix("hermes-search://")
-        ok, items, error = fetch_hermes_search(query, src.category, limit=6)
-        update_source_health(state, src, ok, len(items), error)
-        if ok:
-            categories[src.category].extend(items)
     ranked = build_ranked_categories(categories)
+    gap_sections = thin_sections_from_ranked(ranked)
+    gap_fill = {
+        "sections": {
+            section: {
+                "query": GAP_FILL_QUERIES[section],
+                "triggers": section_gap_reasons(ranked, section),
+            }
+            for section in gap_sections
+        },
+        "calls": [],
+    }
+    if gap_sections:
+        def fetch_gap(section: str) -> tuple[str, bool, list[dict[str, Any]], str | None]:
+            source = canonical_search_source(section)
+            try:
+                ok, items, error = fetch_canonical_web_search(
+                    GAP_FILL_QUERIES[section],
+                    source.category,
+                    limit=8,
+                )
+            except Exception as exc:
+                return section, False, [], f"{type(exc).__name__}: {exc}"
+            return section, ok, items, error
 
-    recovery_rss_sources: list[Source] = []
-    for section in thin_sections_from_ranked(ranked):
-        recovery_rss_sources.extend(RECOVERY_RSS_SOURCES.get(section, []))
-    recovery_rss_sources = list({src.name: src for src in recovery_rss_sources}.values())
-    fetch_recovery_rss_sources(recovery_rss_sources, state, categories)
-    if recovery_rss_sources:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=min(len(gap_sections), 3)) as pool:
+            futures = [pool.submit(fetch_gap, section) for section in gap_sections]
+            for fut in concurrent.futures.as_completed(futures):
+                section, ok, items, error = fut.result()
+                source = canonical_search_source(section)
+                update_source_health(state, source, ok, len(items), error)
+                if ok:
+                    categories[source.category].extend(items)
+                gap_fill["calls"].append({
+                    "section": section,
+                    "query": GAP_FILL_QUERIES[section],
+                    "backend": "searxng",
+                    "ok": ok,
+                    "candidate_count": len(items),
+                    "error": error,
+                })
+        gap_fill["calls"].sort(key=lambda call: call["section"])
         ranked = build_ranked_categories(categories)
-
-    recovery_searches = []
-    thin_sections = thin_sections_from_ranked(ranked)
-    if "domestic" in thin_sections:
-        recovery_searches.append(Source(
-            "Hermes Search 国内定向恢复",
-            "domestic",
-            "hermes-search://site:gov.cn OR site:news.cn OR site:people.com.cn 中国 今日 发布 政策 经济",
-            priority=60,
-        ))
-    if "world" in thin_sections:
-        recovery_searches.append(Source(
-            "Hermes Search 国际定向恢复",
-            "world",
-            "hermes-search://site:bbc.com/zhongwen OR site:rfi.fr/cn 国际 最新 冲突 政策",
-            priority=60,
-        ))
-    if "tech" in thin_sections:
-        recovery_searches.append(Source(
-            "Hermes Search 科技定向恢复",
-            "ai",
-            "hermes-search://AI OpenAI Anthropic semiconductor chip model latest news",
-            priority=58,
-        ))
-    for src in recovery_searches:
-        if score_source(src, state) < 0:
-            continue
-        query = src.url.removeprefix("hermes-search://")
-        ok, items, error = fetch_hermes_search(query, src.category, limit=10)
-        update_source_health(state, src, ok, len(items), error)
-        if ok:
-            categories[src.category].extend(items)
-    if recovery_searches:
-        ranked = build_ranked_categories(categories)
-    active_names = {src.name for src in SOURCES} | {src.name for src in search_sources} | {
-        src.name for src in recovery_searches
-    } | {src.name for src in all_recovery_rss_sources()}
+        for section in gap_sections:
+            gap_fill["sections"][section]["accepted_count"] = selected_count_from_ranked(ranked, section)
+            gap_fill["sections"][section]["remaining_triggers"] = section_gap_reasons(ranked, section)
+    active_names = {src.name for src in SOURCES} | {
+        canonical_search_source(section).name
+        for section in ("domestic", "world", "tech")
+    }
     state = {name: value for name, value in state.items() if name in active_names}
     write_json(STATE_FILE, state)
-    return ranked, state
+    return ranked, state, gap_fill
 
 
 def valid_article_url(value: str | None) -> bool:
@@ -1183,7 +1270,7 @@ def rank_items(items: list[dict[str, Any]], category: str) -> list[dict[str, Any
     return ranked[:18]
 
 
-def collect_weather() -> dict[str, Any]:
+def _collect_weather_primary() -> dict[str, Any]:
     url = (
         "https://api.open-meteo.com/v1/forecast?"
         f"latitude={WUXI_LAT}&longitude={WUXI_LON}"
@@ -1242,9 +1329,77 @@ def collect_weather() -> dict[str, Any]:
         return {"ok": False, "source": "Open-Meteo", "error": f"{type(exc).__name__}: {exc}", "fetched_at": now().isoformat()}
 
 
+def _weather_fallback_item_is_usable(item: dict[str, Any]) -> bool:
+    text = normalize_zh(
+        f"{item.get('title') or ''} {item.get('summary') or ''}"
+    )
+    if "无锡" not in text or not re.search(
+        r"天气|气温|温度|预报|降雨|雷雨|晴|阴|多云",
+        text,
+    ):
+        return False
+    host = (urlsplit(item.get("url") or "").hostname or "").lower()
+    return host == "weather.com.cn" or host.endswith(
+        (".weather.com.cn", ".cma.cn", ".weather.gov.cn", ".nmc.cn")
+    )
+
+
+def _collect_weather_fallback(primary: dict[str, Any]) -> dict[str, Any]:
+    query = GAP_FILL_QUERIES["weather"]
+    try:
+        search_ok, items, error = fetch_canonical_web_search(query, "weather", limit=5)
+    except Exception as exc:
+        search_ok, items, error = False, [], f"{type(exc).__name__}: {exc}"
+    accepted = next(
+        (item for item in items if search_ok and _weather_fallback_item_is_usable(item)),
+        None,
+    )
+    search_record = {
+        "attempted": True,
+        "query": query,
+        "backend": "searxng",
+        "candidate_count": len(items),
+        "accepted": bool(accepted),
+        "error": error,
+    }
+    if accepted:
+        return {
+            "ok": True,
+            "source": "canonical web_search",
+            "fallback": True,
+            "fetched_at": now().isoformat(),
+            "reference_title": display_title(accepted.get("title") or "", max_len=80),
+            "reference_summary": clean_text(accepted.get("summary") or "")[:220],
+            "reference_source": accepted.get("display_source") or normalized_source(accepted),
+            "primary_error": primary.get("error"),
+            "fallback_search": search_record,
+        }
+    failure = dict(primary)
+    failure["fallback_search"] = search_record
+    failure["error"] = (
+        f"{primary.get('error', 'primary weather source failed')}; "
+        f"fallback: {error or 'no authoritative Wuxi weather result'}"
+    )[:300]
+    return failure
+
+
+def collect_weather() -> dict[str, Any]:
+    primary = _collect_weather_primary()
+    if primary.get("ok"):
+        return primary
+    return _collect_weather_fallback(primary)
+
+
 def weather_line(weather: dict[str, Any]) -> str:
     if not weather.get("ok"):
         return "天气源暂不可用，出门前再确认一下实时天气。"
+    if weather.get("fallback"):
+        title = clean_text(weather.get("reference_title") or "")
+        source = clean_text(weather.get("reference_source") or "")
+        reference = f"搜索参考：{title}" if title else "搜索参考：无锡天气信息"
+        if source:
+            reference += f"（{source}）"
+        return reference + "，出门前再确认实时天气。"
     parts = [f"{weather.get('condition', '天气待确认')}"]
     if weather.get("min_c") is not None and weather.get("max_c") is not None:
         parts.append(f"{round(weather['min_c'])}~{round(weather['max_c'])}℃")
@@ -1262,7 +1417,9 @@ def weather_line(weather: dict[str, Any]) -> str:
 
 def weather_action(weather: dict[str, Any]) -> str | None:
     if not weather.get("ok"):
-        return "天气源暂不可用，出门前再确认一下实时天气。"
+        return None
+    if weather.get("fallback"):
+        return None
     actions = []
     commute_rain = weather.get("commute_rain_probability")
     rain = commute_rain if commute_rain is not None else weather.get("rain_probability")
@@ -1296,6 +1453,9 @@ def fmt_items(
         title = display_title(override or item.get("title") or "")
         if not title:
             continue
+        uncertainty = uncertainty_label(item)
+        if uncertainty:
+            title = f"[{uncertainty}] {title}"
         lines.append(f"{i}. {title}{source_label(item)}")
     return lines
 
@@ -1385,6 +1545,13 @@ def choose_focus(selected: dict[str, list[dict[str, Any]]]) -> dict[str, Any] | 
         return None
     valid.sort(key=lambda x: x.get("brief_score", x.get("score", 0)), reverse=True)
     return valid[0]
+
+
+def uncertainty_label(item: dict[str, Any]) -> str:
+    title = item.get("original_title") or item.get("title") or ""
+    if "unconfirmed" in set(item.get("score_reasons", [])) or RUMOR_RE.search(title):
+        return "爆料/推测，尚未官方确认"
+    return ""
 
 
 def select_sections(payload: dict[str, Any]) -> dict[str, list[dict[str, Any]]]:
@@ -1851,6 +2018,7 @@ def make_quality(payload: dict[str, Any], selected: dict[str, list[dict[str, Any
         "quality_warnings": warnings,
         "source_diversity_7d": diversity,
         "source_health_summary": source_health_summary(payload.get("source_health", {})),
+        "gap_fill": payload.get("gap_fill", {}),
         "next_best_rejected": candidate_diagnostics(payload, selected),
         "selected": [item_quality_record(item) for item in all_selected],
     }
@@ -1859,10 +2027,10 @@ def make_quality(payload: dict[str, Any], selected: dict[str, list[dict[str, Any
 def make_degraded_message(reason: str) -> str:
     return (
         "☀️ 早，Max\n\n"
-        "🌤 无锡天气：\n"
-        "晨报系统正在降级运行，天气和新闻源没有完整准备好。\n\n"
-        "📌 今日提醒\n"
-        f"{reason}。系统已保留状态文件，后续会自动恢复，不需要手动调源。"
+        "🌤 无锡天气\n"
+        "天气源暂不可用，出门前再确认一下实时天气。\n\n"
+        "⚠️ 晨报状态\n"
+        f"晨报系统正在降级运行：{reason}。系统已保留状态文件，后续会自动恢复。"
     )
 
 
@@ -1925,6 +2093,9 @@ def render_message(
     ]
     if focus_item is not None:
         focus_lines = ["发生了什么：" + (focus.get("what") or "")]
+        uncertainty = uncertainty_label(focus_item)
+        if uncertainty:
+            focus_lines.insert(0, "信息性质：" + uncertainty)
         if focus.get("why"):
             focus_lines.append("为什么值得关注：" + focus["why"])
         blocks.append(
@@ -1955,16 +2126,74 @@ def validate_message(text: str) -> tuple[bool, str | None]:
     return True, None
 
 
+def _artifact_timestamp(value: Any) -> datetime | None:
+    if not isinstance(value, str) or not value.strip():
+        return None
+    try:
+        parsed = datetime.fromisoformat(value.strip().replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    return parsed.replace(tzinfo=TZ) if parsed.tzinfo is None else parsed.astimezone(TZ)
+
+
+def artifact_is_current(d: Path, *, require_render: bool = False) -> tuple[bool, str]:
+    """Validate date, generation time, source health, and optional render state."""
+    expected_date = now().date().isoformat()
+    payload = read_json(d / "input.json", None)
+    if not isinstance(payload, dict):
+        return False, "missing input artifact"
+    if payload.get("date") != expected_date:
+        return False, "artifact date does not match today"
+    generated_at = _artifact_timestamp(payload.get("generated_at"))
+    if generated_at is None:
+        return False, "missing artifact generated_at"
+    current = now()
+    if generated_at.date() != current.date():
+        return False, "artifact generated_at is not today"
+    if generated_at > current + timedelta(minutes=5):
+        return False, "artifact generated_at is in the future"
+    if current - generated_at > timedelta(hours=6):
+        return False, "artifact is older than six hours"
+    if not isinstance(payload.get("weather"), dict):
+        return False, "missing weather artifact"
+    if not isinstance(payload.get("news"), dict):
+        return False, "missing news artifact"
+    source_health = payload.get("source_health")
+    if not isinstance(source_health, dict):
+        return False, "missing source health artifact"
+    if not source_health:
+        return False, "empty source health artifact"
+    health_dates = {
+        timestamp.date()
+        for item in source_health.values()
+        if isinstance(item, dict)
+        for timestamp in [_artifact_timestamp(item.get("last_checked_at"))]
+        if timestamp is not None
+    }
+    if current.date() not in health_dates:
+        return False, "source health is not current"
+    quality = read_json(d / "quality.json", None)
+    if not isinstance(quality, dict) or not isinstance(quality.get("source_health_summary"), dict):
+        return False, "missing source health summary"
+    if require_render:
+        status = read_json(d / "render_status.json", None)
+        rendered_at = _artifact_timestamp(status.get("rendered_at")) if isinstance(status, dict) else None
+        if rendered_at is None or rendered_at.date() != current.date():
+            return False, "missing current render status"
+    return True, "current"
+
+
 def collect() -> None:
     d = today_dir()
     weather = collect_weather()
-    news, state = collect_news()
+    news, state, gap_fill = collect_news()
     payload = {
         "date": now().date().isoformat(),
         "generated_at": now().isoformat(),
         "weather": weather,
         "news": news,
         "source_health": state,
+        "gap_fill": gap_fill,
     }
     write_json(d / "input.json", payload)
     selected = select_sections(payload)
@@ -1977,13 +2206,10 @@ def collect() -> None:
 def render() -> None:
     d = today_dir()
     payload = read_json(d / "input.json", None)
-    if payload is None:
+    current, _ = artifact_is_current(d)
+    if not current:
         collect()
         payload = read_json(d / "input.json", {})
-    weather_bad = not payload.get("weather", {}).get("ok")
-    if weather_bad:
-        collect()
-        payload = read_json(d / "input.json", payload)
     selected = select_sections(payload)
     enhancement = enhance_selected_with_llm(selected)
     write_json(d / "enhancement.json", enhancement)
@@ -2001,6 +2227,8 @@ def render() -> None:
     quality = make_quality(payload, selected)
     write_json(d / "quality.json", quality)
     write_json(d / "render_status.json", {
+        "artifact_date": payload.get("date"),
+        "input_generated_at": payload.get("generated_at"),
         "ok": ok,
         "error": err,
         "rendered_at": now().isoformat(),
@@ -2032,22 +2260,25 @@ def health() -> None:
 def ensure_ready() -> Path:
     d = today_dir()
     final = d / "final.md"
-    if final.exists():
-        text = final.read_text(encoding="utf-8").strip()
-        ok, _ = validate_message(text)
-        if text and ok and not is_degraded_message(text):
-            return final
-    candidate = d / "candidate.md"
-    if candidate.exists():
-        text = candidate.read_text(encoding="utf-8").strip()
-        ok, _ = validate_message(text)
-        if text and ok:
-            return candidate
-    if final.exists() and final.read_text(encoding="utf-8").strip():
-        return final
-    fallback = d / "fallback.md"
-    if fallback.exists() and fallback.read_text(encoding="utf-8").strip():
-        return fallback
+    artifact_current, _ = artifact_is_current(d)
+    if artifact_current:
+        if final.exists():
+            text = final.read_text(encoding="utf-8").strip()
+            ok, _ = validate_message(text)
+            if text and ok and not is_degraded_message(text):
+                return final
+        candidate = d / "candidate.md"
+        if candidate.exists():
+            text = candidate.read_text(encoding="utf-8").strip()
+            ok, _ = validate_message(text)
+            if text and ok:
+                return candidate
+        fallback = d / "fallback.md"
+        if fallback.exists():
+            text = fallback.read_text(encoding="utf-8").strip()
+            ok, _ = validate_message(text)
+            if text and ok:
+                return fallback
     try:
         collect()
         render()
@@ -2056,6 +2287,7 @@ def ensure_ready() -> Path:
         emergency = d / "emergency.md"
         emergency.write_text(msg + "\n", encoding="utf-8")
         return emergency
+    fallback = d / "fallback.md"
     return final if final.exists() else fallback
 
 
