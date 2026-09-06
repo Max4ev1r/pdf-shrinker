@@ -6,11 +6,15 @@ from __future__ import annotations
 import datetime as dt
 import importlib
 import json
+import re
 import os
 import sqlite3
 import sys
+import tempfile
 import time
+from contextlib import nullcontext
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 
@@ -185,12 +189,23 @@ def evaluate_case(
     case: dict[str, Any],
     *,
     accepted_modes: set[str],
+    production: bool = False,
 ) -> dict[str, Any]:
     started = time.monotonic()
-    payload = parse_tool_json(provider.handle_tool_call(
-        "vault_search",
-        {"query": case["query"], "top_k": 10},
-    ))
+    automatic = bool(case.get("automatic", case.get("expect_empty", False)))
+    context = ""
+    if automatic:
+        context = provider.prefetch(case["query"], session_id="memory-retrieval-eval")
+        ids = re.findall(r"^- \[([^\]]+)\]", context, re.M)
+        payload = {
+            "results": [{"id": marker} for marker in ids],
+            "mode": provider._vault.local_search_mode(),
+        }
+    else:
+        payload = parse_tool_json(provider.handle_tool_call(
+            "vault_search",
+            {"query": case["query"], "top_k": 10},
+        ))
     elapsed_ms = int((time.monotonic() - started) * 1000)
     results = payload.get("results", []) if isinstance(payload.get("results"), list) else []
     memories = [str(item.get("id", "")) for item in results]
@@ -199,8 +214,16 @@ def evaluate_case(
     matched = [marker for marker in expected_any if marker in memories]
     actual_mode = str(payload.get("mode", "unknown"))
     expect_empty = bool(case.get("expect_empty"))
-    content_passed = not memories if expect_empty else bool(matched)
-    precision_passed = all(memory_id in allowed_ids for memory_id in memories)
+    content_passed = (not context if automatic else not memories) if expect_empty else bool(matched)
+    unknown_ids = [marker for marker in memories if marker not in allowed_ids]
+    # Production is an open corpus: unlabelled results are neither known
+    # errors nor known-relevant. Closed-corpus precision remains a required
+    # part of the overall evaluation below, never a production ID whitelist.
+    precision_passed = (
+        content_passed if expect_empty else
+        None if production else not unknown_ids
+    )
+    temporal_passed = all(label in context for label in case.get("required_context", []))
     mode_passed = actual_mode in accepted_modes
     error = payload.get("error") or payload.get("degraded_reason", "")
     return {
@@ -210,12 +233,17 @@ def evaluate_case(
         "matched": matched,
         "passed": (
             content_passed
-            and precision_passed
+            and precision_passed is not False
+            and temporal_passed
             and mode_passed
             and not error
         ),
         "content_passed": content_passed,
         "precision_passed": precision_passed,
+        "precision_scope": "open-corpus-unjudged" if production and not expect_empty else "closed-corpus",
+        "unjudged_ids": unknown_ids if production else [],
+        "automatic": automatic,
+        "temporal_passed": temporal_passed,
         "mode_passed": mode_passed,
         "mode": actual_mode,
         "accepted_modes": sorted(accepted_modes),
@@ -331,6 +359,10 @@ def write_report(payload: dict[str, Any]) -> None:
             f"- matched: `{', '.join(case['matched']) or 'none'}`",
             f"- expected_any: `{', '.join(case['expected_any'])}`",
             f"- precision_passed: `{case['precision_passed']}`",
+            f"- precision_scope: `{case['precision_scope']}`",
+            f"- retrieval_path: `{'automatic prefetch' if case['automatic'] else 'explicit search'}`",
+            f"- unjudged_ids: `{', '.join(case['unjudged_ids']) or 'none'}`",
+            f"- temporal_passed: `{case['temporal_passed']}`",
             f"- allowed_ids: `{', '.join(case['allowed_ids']) or 'none'}`",
             f"- query: `{case['query']}`",
             "",
@@ -344,6 +376,68 @@ def write_report(payload: dict[str, Any]) -> None:
     md_path.write_text("\n".join(lines).rstrip() + "\n", encoding="utf-8")
 
 
+def evaluate_closed_corpus(provider) -> list[dict[str, Any]]:
+    """Exercise the real index and plugin on a disposable labelled corpus.
+
+    This never initializes a Vault, writes authority data, or rebuilds the
+    production index. Only the existing local embedder is shared.
+    """
+    from memory_vault_lib.local_index import LocalSearchIndex
+
+    facts = {
+        "fixture_project": "我的 Pine 项目使用 Python asyncio 和 SQLite；部署在单机上，禁止引入 Redis 服务。",
+        "fixture_style": "我的表达偏好：回答先给结论，再给理由，中文为主，避免冗长铺垫。",
+        "fixture_skin_current": "[CURRENT] 我的当前护肤方案：温和洁面和保湿，暂停刺激性产品。",
+        "fixture_skin_history": "[HISTORICAL/current-to-confirm] 我的历史护肤记录：曾经使用酸类产品；不能作为当前方案。",
+        "fixture_food": "我的饮食限制：花生过敏，餐厅推荐必须排除花生。",
+        "fixture_travel": "我的旅行计划：下个月去京都，优先参观寺庙和博物馆。",
+    }
+    records = [
+        {"id": marker, "title": body, "summary": body, "body": body,
+         "status": "active", "topic": "fixture", "tags": [],
+         "updated_at": "2026-01-01", "content_hash": marker}
+        for marker, body in facts.items()
+    ]
+    cases = [
+        {"name": "precision_project", "query": "我的 Pine 项目采用什么数据库和异步实现？",
+         "expected_any": ["fixture_project"], "automatic": True},
+        {"name": "precision_style", "query": "按我的表达偏好组织回答，应该怎么写？",
+         "expected_any": ["fixture_style"], "automatic": True},
+        {"name": "personalized_programming", "query": "结合我现在 Pine 的 Python 实现解释 async await",
+         "expected_any": ["fixture_project"], "automatic": True},
+        {"name": "personalized_translation", "query": "按我平时喜欢的表达方式翻译这段话",
+         "expected_any": ["fixture_style"], "automatic": True},
+        {"name": "precision_skin_temporal", "query": "我的当前和历史护肤方案有什么区别？",
+         "expected_any": ["fixture_skin_current", "fixture_skin_history"],
+         "automatic": True, "required_context": ["[CURRENT]", "[HISTORICAL/current-to-confirm]", "不能作为当前方案"]},
+        {"name": "precision_food", "query": "我的饮食限制是什么？",
+         "expected_any": ["fixture_food"], "automatic": True},
+        {"name": "explicit_search_preserved", "query": "Pine 项目采用什么数据库和异步实现？",
+         "expected_any": ["fixture_project"]},
+        {"name": "automatic_generic_programming", "query": "解释一下 Python 的 async await", "expected_any": [], "expect_empty": True},
+        {"name": "automatic_generic_translation", "query": "把 good morning 翻译成中文", "expected_any": [], "expect_empty": True},
+        {"name": "automatic_generic_food", "query": "解释一下花生过敏的定义", "expected_any": [], "expect_empty": True},
+        {"name": "automatic_quoted_personal_text", "query": '翻译“我的项目使用 Python”', "expected_any": [], "expect_empty": True},
+    ]
+    with tempfile.TemporaryDirectory(prefix="memory-retrieval-fixture-") as directory:
+        index = LocalSearchIndex(
+            path=Path(directory) / "index.sqlite3", schema_version=1,
+            embedding_model=provider._vault.LOCAL_EMBEDDING_MODEL,
+            alias_groups=provider._vault.SEARCH_ALIAS_GROUPS,
+            embedder_factory=provider._vault.get_local_embedder,
+            ensure_layout=lambda: None, lock_factory=nullcontext,
+        )
+        index.build(records, index.path)
+        fixture = type(provider)()
+        fixture._vault = SimpleNamespace(
+            local_search=lambda query, top_k=10: index.search(records, query, top_k=top_k),
+            local_search_mode=lambda: index.health(records)["mode"],
+        )
+        # A closed corpus has no personal session history outside its labels.
+        fixture._search_session_history = lambda query, top_k=3: []
+        return [evaluate_case(fixture, case, accepted_modes={"local-hybrid"}) for case in cases]
+
+
 def main() -> int:
     ensure_hermes_runtime()
     provider = load_provider()
@@ -351,9 +445,10 @@ def main() -> int:
         backend_checks = evaluate_backends(provider)
         accepted_modes = {"local-hybrid"}
         cases = [
-            evaluate_case(provider, case, accepted_modes=accepted_modes)
+            evaluate_case(provider, case, accepted_modes=accepted_modes, production=True)
             for case in CASES
         ]
+        cases.extend(evaluate_closed_corpus(provider))
     finally:
         try:
             provider.shutdown()

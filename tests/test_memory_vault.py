@@ -382,8 +382,8 @@ def test_local_search_filters_weak_candidates_before_ranking(
     sqlite3.connect(vault.LOCAL_INDEX_PATH).close()
     monkeypatch.setattr(manager, "ensure", lambda records: False)
     monkeypatch.setattr(manager, "fts_search", lambda conn, query, top_k: [
-        {"id": "dual", "title": "dual", "updated_at": "2026", "rank": -50.0},
-        {"id": "weak", "title": "weak", "updated_at": "2026", "rank": -5.0},
+        {"id": "dual", "title": "dual", "updated_at": "2026", "rank": -50.0, "search_tokens": "query"},
+        {"id": "weak", "title": "weak", "updated_at": "2026", "rank": -5.0, "search_tokens": "query"},
     ])
     monkeypatch.setattr(manager, "vector_search", lambda conn, query, top_k: [
         {"id": "semantic", "title": "semantic", "updated_at": "2026", "semantic_score": 0.70},
@@ -683,6 +683,12 @@ def test_retrieval_eval_requires_negative_queries_to_abstain():
     name, retrieval = load_retrieval_eval_module()
 
     class Provider:
+        _vault = types.SimpleNamespace(local_search_mode=lambda: "local-hybrid")
+
+        @staticmethod
+        def prefetch(query, **kwargs):
+            return "## Vault Memory\n- [mem_noise] noise"
+
         @staticmethod
         def handle_tool_call(tool_name, args):
             return json.dumps({
@@ -706,6 +712,61 @@ def test_retrieval_eval_requires_negative_queries_to_abstain():
         assert not result["passed"]
         assert not result["content_passed"]
         assert not result["precision_passed"]
+    finally:
+        sys.modules.pop(name, None)
+
+
+def test_retrieval_eval_open_corpus_does_not_label_unknown_ids():
+    name, retrieval = load_retrieval_eval_module()
+
+    class Provider:
+        def handle_tool_call(self, tool_name, args):
+            return json.dumps({"mode": "local-hybrid", "results": [
+                {"id": "expected"}, {"id": "unlabelled"},
+            ]})
+
+    try:
+        case = {"name": "recall", "query": "query", "expected_any": ["expected"]}
+        result = retrieval.evaluate_case(Provider(), case, accepted_modes={"local-hybrid"}, production=True)
+        assert result["passed"] and result["precision_passed"] is None
+        assert result["unjudged_ids"] == ["unlabelled"]
+        closed = retrieval.evaluate_case(Provider(), case, accepted_modes={"local-hybrid"})
+        assert not closed["passed"] and not closed["precision_passed"]
+        case["expected_any"] = ["missing"]
+        assert not retrieval.evaluate_case(Provider(), case, accepted_modes={"local-hybrid"}, production=True)["passed"]
+    finally:
+        sys.modules.pop(name, None)
+
+
+def test_automatic_evaluation_detects_noise_abstention_and_temporal_loss():
+    name, retrieval = load_retrieval_eval_module()
+
+    class Provider:
+        _vault = types.SimpleNamespace(local_search_mode=lambda: "local-hybrid")
+        context = ""
+
+        def prefetch(self, query, **kwargs):
+            return self.context
+
+        def handle_tool_call(self, *args):
+            raise AssertionError("automatic evaluation must not call explicit search")
+
+    try:
+        provider = Provider()
+        positive = {"name": "personal", "query": "my history", "expected_any": ["known"],
+                    "automatic": True, "required_context": ["HISTORICAL"]}
+        negative = {"name": "generic", "query": "generic", "expected_any": [], "expect_empty": True}
+        check = lambda case: retrieval.evaluate_case(provider, case, accepted_modes={"local-hybrid"})
+        assert not check(positive)["passed"]  # disabling all recall is not a fix
+        provider.context = "## Vault Memory\n- [known] HISTORICAL fact"
+        assert check(positive)["passed"]
+        assert not check(negative)["passed"]
+        provider.context = "## Vault Memory\n- [known] current fact"
+        assert not check(positive)["temporal_passed"]
+        provider.context = "## Vault Memory\n- [known] HISTORICAL fact\n- [noise] unrelated"
+        assert not check(positive)["precision_passed"]
+        provider.context = "Unstructured history without any IDs"
+        assert not check(negative)["passed"]
     finally:
         sys.modules.pop(name, None)
 
