@@ -40,6 +40,7 @@ class DeliveryTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
             (root / '.env').write_text('secret')
+            (root / 'test_durations.json').write_text('{}')
             (root / '.venv').mkdir()
             (root / '.venv' / 'package.py').write_text('runtime')
             (root / 'feature.py').write_text('code')

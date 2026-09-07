@@ -29,7 +29,7 @@ def source_files(root):
         dirs[:] = sorted(d for d in dirs if d not in EXCLUDED and not d.startswith('.'))
         for name in sorted(files):
             path = Path(parent) / name
-            if name.startswith('.') or path.suffix not in SOURCE_SUFFIXES:
+            if name.startswith('.') or name == 'test_durations.json' or path.suffix not in SOURCE_SUFFIXES:
                 continue
             if path.is_symlink():
                 raise ValueError(f'Explicitly inventory symlink target: {path}')
