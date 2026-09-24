@@ -181,21 +181,43 @@ def run_checks(hermes_home: Path | None = None) -> dict:
         except Exception as e:
             fail("class_a_backup_coverage", f"{type(e).__name__}: {e}")
 
-    # offsite freshness if configured
-    offsite_dir = Path(os.environ.get("HERMES_MEMORY_OFFSITE_DIR", "") or (home / "offsite" / "memory-vault"))
+    # offsite freshness on the canonical destination (iCloud / configured path)
+    try:
+        import importlib.util as _ilu
+        bkspec = _ilu.spec_from_file_location("_bk_ic", home / "scripts" / "memory_vault_backup.py")
+        bk = _ilu.module_from_spec(bkspec)
+        bkspec.loader.exec_module(bk)
+        offsite_dir = bk.resolve_offsite_dir()
+    except Exception:
+        offsite_dir = Path(os.environ.get("HERMES_MEMORY_OFFSITE_DIR", "") or (home / "offsite" / "memory-vault"))
+        bk = None
     offsite = {"dir": str(offsite_dir), "configured": offsite_dir.exists()}
-    if offsite_dir.exists():
-        gens = sorted(offsite_dir.glob("vault-*.tar.gz"))
-        offsite["generations"] = [g.name for g in gens[-3:]]
+    if offsite_dir.exists() and bk is not None:
+        gens = bk.offsite_ready_generations(offsite_dir)
+        offsite["ready_generations"] = [g["backup_id"] for g in gens[-3:]]
         if not gens:
-            fail("offsite_freshness", "offsite dir empty")
+            fail("offsite_freshness", "no READY offsite generation")
         else:
-            age_d = (datetime.now().astimezone() - datetime.fromtimestamp(gens[-1].stat().st_mtime).astimezone()).days
-            offsite["age_days"] = age_d
-            if age_d > 14:
-                fail("offsite_freshness", f"latest offsite age {age_d}d")
+            latest = gens[-1]
+            check = bk.verify_offsite_generation(latest)
+            offsite["latest_verify"] = check
+            if not check.get("valid"):
+                fail("offsite_freshness", f"latest generation invalid: {check.get('reason')}", check=check)
             else:
-                ok("offsite_freshness")
+                age_d = (datetime.now().astimezone() - datetime.fromtimestamp(latest["archive"].stat().st_mtime).astimezone()).days
+                offsite["age_days"] = age_d
+                sync = bk.icloud_sync_status(latest["archive"])
+                offsite["sync"] = sync
+                if age_d > 7:
+                    fail("offsite_freshness", f"latest READY offsite age {age_d}d")
+                elif sync.get("sync_error"):
+                    fail("offsite_freshness", f"sync error: {sync.get('detail')}")
+                elif sync.get("upload_pending"):
+                    fail("offsite_freshness", "upload still pending", sync=sync)
+                elif sync.get("remote_durability_verified") is False:
+                    fail("offsite_freshness", "remote durability not verified by system APIs", sync=sync)
+                else:
+                    ok("offsite_freshness")
     else:
         fail("offsite_freshness", "no offsite destination configured")
 

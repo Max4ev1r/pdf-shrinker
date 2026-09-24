@@ -489,15 +489,225 @@ def verify_snapshot(archive: Path) -> dict[str, Any]:
     }
 
 
-def export_offsite(dest: Path, *, archive: Path | None = None) -> dict[str, Any]:
-    """Copy one verified generation + manifest + checksum to a failure-domain split path.
+def resolve_offsite_dir() -> Path:
+    """Canonical offsite destination: env > config.yaml memory.offsite_dir > .env."""
+    env = os.environ.get("HERMES_MEMORY_OFFSITE_DIR", "").strip()
+    if env:
+        return Path(env).expanduser()
+    config = HERMES_HOME / "config.yaml"
+    if config.exists():
+        try:
+            text = config.read_text(encoding="utf-8")
+            in_memory = False
+            for line in text.splitlines():
+                if line.startswith("memory:"):
+                    in_memory = True
+                    continue
+                if in_memory and line[:1] not in (" ", "\t"):
+                    in_memory = False
+                    continue
+                if in_memory and "offsite_dir:" in line:
+                    raw = line.split(":", 1)[1].strip().strip("'\"")
+                    if raw:
+                        return Path(raw).expanduser()
+        except Exception:
+            pass
+    env_file = HERMES_HOME / ".env"
+    if env_file.exists():
+        for line in env_file.read_text(encoding="utf-8").splitlines():
+            if line.startswith("HERMES_MEMORY_OFFSITE_DIR="):
+                raw = line.split("=", 1)[1].strip().strip("'\"")
+                if raw:
+                    return Path(raw).expanduser()
+    return HERMES_HOME / "offsite" / "memory-vault"
 
-    Provider-agnostic: dest is any user-managed directory (external disk, NAS
-    mount, synced folder). Does not configure cloud accounts.
+
+def offsite_ready_generations(dest: Path) -> list[dict[str, Any]]:
+    """Only READY/COMPLETE generations are restore-eligible."""
+    dest = dest.expanduser()
+    if not dest.exists():
+        return []
+    out: list[dict[str, Any]] = []
+    for ready in sorted(dest.glob("vault-*.tar.gz.ready.json")):
+        archive = ready.with_name(ready.name.removesuffix(".ready.json"))
+        manifest = archive.with_name(archive.name + ".manifest.json")
+        checksum = dest / (archive.name + ".sha256")
+        if not archive.exists():
+            continue
+        try:
+            ready_doc = json.loads(ready.read_text(encoding="utf-8"))
+        except Exception:
+            continue
+        if ready_doc.get("state") != "complete":
+            continue
+        out.append({
+            "archive": archive,
+            "manifest": manifest,
+            "checksum": checksum,
+            "ready": ready,
+            "backup_id": ready_doc.get("backup_id") or archive.name.removesuffix(".tar.gz"),
+            "created_at": ready_doc.get("created_at", ""),
+        })
+    return out
+
+
+def prune_offsite(dest: Path) -> dict[str, Any]:
+    """Same 30d/12m/10y policy; never deletes the newest READY generation."""
+    pairs = offsite_ready_generations(dest)
+    if not pairs:
+        return {"kept": 0, "removed": 0}
+    today = dt.datetime.now().date()
+    keep: set[Path] = {pairs[-1]["archive"]}  # always keep latest known-good READY
+    monthly: set[str] = set()
+    yearly: set[str] = set()
+    for item in reversed(pairs):
+        archive = item["archive"]
+        try:
+            when = dt.datetime.strptime(archive.name[6:21], "%Y%m%d-%H%M%S").date()
+        except ValueError:
+            keep.add(archive)
+            continue
+        age = (today - when).days
+        if age <= 30 or archive in keep:
+            keep.add(archive)
+        elif age <= 365:
+            key = when.strftime("%Y-%m")
+            if key not in monthly and len(monthly) < 12:
+                keep.add(archive)
+                monthly.add(key)
+        else:
+            key = when.strftime("%Y")
+            if key not in yearly and len(yearly) < 10:
+                keep.add(archive)
+                yearly.add(key)
+    removed = 0
+    for item in pairs:
+        archive = item["archive"]
+        if archive in keep:
+            continue
+        for path in (
+            archive,
+            item["manifest"],
+            item["checksum"],
+            item["ready"],
+            archive.with_name(archive.name + ".partial.json"),
+        ):
+            path.unlink(missing_ok=True)
+        removed += 1
+    return {"kept": len(keep), "removed": removed}
+
+
+def verify_offsite_generation(item: dict[str, Any]) -> dict[str, Any]:
+    archive: Path = item["archive"]
+    manifest_path: Path = item["manifest"]
+    checksum_path: Path = item["checksum"]
+    if not archive.exists() or not manifest_path.exists():
+        return {"valid": False, "reason": "archive_or_manifest_missing"}
+    if not item.get("ready") or not Path(item["ready"]).exists():
+        return {"valid": False, "reason": "ready_marker_missing"}
+    try:
+        ready_doc = json.loads(Path(item["ready"]).read_text(encoding="utf-8"))
+        if ready_doc.get("state") != "complete":
+            return {"valid": False, "reason": "ready_state_not_complete"}
+    except Exception as e:
+        return {"valid": False, "reason": f"ready_parse:{e}"}
+    try:
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    except Exception as e:
+        return {"valid": False, "reason": f"manifest_parse:{e}"}
+    digest = sha256_file(archive)
+    if manifest.get("archive_sha256") != digest:
+        return {"valid": False, "reason": "archive_sha256_mismatch"}
+    if checksum_path.exists():
+        claimed = checksum_path.read_text(encoding="utf-8").split()[0]
+        if claimed != digest:
+            return {"valid": False, "reason": "sidecar_sha256_mismatch"}
+    return {
+        "valid": True,
+        "backup_id": item.get("backup_id"),
+        "archive_sha256": digest,
+        "manifest_class_a": manifest.get("class_a_components", []),
+        "components": manifest.get("components", []),
+    }
+
+
+def icloud_sync_status(path: Path) -> dict[str, Any]:
+    """iCloud/FileProvider status. Remote durability only if isUploaded=1."""
+    import re
+    import subprocess
+
+    path = Path(path)
+    result = {
+        "path": str(path),
+        "local_file_present": path.exists(),
+        "upload_pending": None,
+        "sync_error": None,
+        "remote_durability_verified": False,
+        "method": [],
+        "detail": {},
+    }
+    if not path.exists():
+        result["sync_error"] = "missing_locally"
+        return result
+    try:
+        st = path.stat()
+        result["detail"]["st_size"] = st.st_size
+        result["detail"]["st_blocks"] = getattr(st, "st_blocks", None)
+    except Exception:
+        pass
+    # Authoritative: fileproviderctl evaluate (iCloud Drive File Provider item state)
+    try:
+        proc = subprocess.run(
+            ["fileproviderctl", "evaluate", str(path)],
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+        result["method"].append("fileproviderctl.evaluate")
+        blob = proc.stdout + "\n" + proc.stderr
+        result["detail"]["evaluate_rc"] = proc.returncode
+        flags = {}
+        for key in (
+            "isUploaded",
+            "isUploading",
+            "isDownloaded",
+            "isDownloading",
+            "hasUnresolvedConflicts",
+            "isSyncPaused",
+            "isExcludedFromSync",
+            "isMostRecentVersionDownloaded",
+        ):
+            m = re.search(rf"{key}\s*=\s*([01])", blob)
+            if m:
+                flags[key] = m.group(1) == "1"
+        result["detail"]["file_provider_flags"] = flags
+        if flags:
+            result["upload_pending"] = bool(flags.get("isUploading")) or (flags.get("isUploaded") is False)
+            result["sync_error"] = bool(flags.get("hasUnresolvedConflicts")) or bool(flags.get("isSyncPaused"))
+            if flags.get("isUploaded") is True and not flags.get("isUploading") and not flags.get("hasUnresolvedConflicts"):
+                result["remote_durability_verified"] = True
+                result["upload_pending"] = False
+            elif flags.get("isUploaded") is False:
+                result["remote_durability_verified"] = False
+        else:
+            result["detail"]["evaluate_raw"] = blob[:800]
+    except Exception as e:
+        result["detail"]["fileprovider_error"] = f"{type(e).__name__}: {e}"
+    return result
+
+
+def export_offsite(dest: Path, *, archive: Path | None = None) -> dict[str, Any]:
+    """Atomically publish one verified generation to a failure-domain split path.
+
+    Publish order: staging files → manifest → checksum → READY(state=complete).
+    Incomplete generations never get READY and are not restore-eligible.
     """
     dest = dest.expanduser()
     dest.mkdir(parents=True, exist_ok=True)
-    dest.chmod(0o700)
+    try:
+        dest.chmod(0o700)
+    except Exception:
+        pass
     if archive is None:
         pairs = snapshot_pairs()
         if not pairs:
@@ -505,22 +715,60 @@ def export_offsite(dest: Path, *, archive: Path | None = None) -> dict[str, Any]
         archive = pairs[-1][0]
     verify_snapshot(archive)
     manifest_path = archive.with_name(archive.name + ".manifest.json")
-    target_archive = dest / archive.name
-    target_manifest = dest / manifest_path.name
-    tmp_a = target_archive.with_suffix(target_archive.suffix + ".tmp")
-    tmp_m = target_manifest.with_suffix(target_manifest.suffix + ".tmp")
-    shutil.copy2(archive, tmp_a)
-    shutil.copy2(manifest_path, tmp_m)
-    os.replace(tmp_a, target_archive)
-    os.replace(tmp_m, target_manifest)
-    checksum = sha256_file(target_archive)
-    checksum_path = dest / (archive.name + ".sha256")
-    checksum_path.write_text(checksum + "  " + archive.name + "\n", encoding="utf-8")
+    staging = dest / f".staging-{archive.stem}-{os.getpid()}"
+    if staging.exists():
+        shutil.rmtree(staging)
+    staging.mkdir(parents=True)
+    try:
+        staged_archive = staging / archive.name
+        staged_manifest = staging / manifest_path.name
+        staged_checksum = staging / (archive.name + ".sha256")
+        staged_ready = staging / (archive.name + ".ready.json")
+        shutil.copy2(archive, staged_archive)
+        shutil.copy2(manifest_path, staged_manifest)
+        checksum = sha256_file(staged_archive)
+        manifest = json.loads(staged_manifest.read_text(encoding="utf-8"))
+        if manifest.get("archive_sha256") != checksum:
+            raise RuntimeError("Staged archive checksum mismatch before publish")
+        staged_checksum.write_text(checksum + "  " + archive.name + "\n", encoding="utf-8")
+        # READY is written last in staging, then published last.
+        ready_doc = {
+            "state": "complete",
+            "backup_id": manifest.get("backup_id") or archive.name.removesuffix(".tar.gz"),
+            "created_at": manifest.get("created_at") or dt.datetime.now().astimezone().isoformat(timespec="seconds"),
+            "archive": archive.name,
+            "archive_sha256": checksum,
+            "class_a_components": manifest.get("class_a_components", []),
+            "components": manifest.get("components", []),
+        }
+        staged_ready.write_text(json.dumps(ready_doc, ensure_ascii=False, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+        # Publish: archive/manifest/checksum first, READY last (atomic visibility gate).
+        os.replace(staging / archive.name, dest / archive.name)
+        os.replace(staging / manifest_path.name, dest / manifest_path.name)
+        os.replace(staging / (archive.name + ".sha256"), dest / (archive.name + ".sha256"))
+        os.replace(staging / (archive.name + ".ready.json"), dest / (archive.name + ".ready.json"))
+    finally:
+        shutil.rmtree(staging, ignore_errors=True)
+    prune_offsite(dest)
+    item = next(
+        (g for g in offsite_ready_generations(dest) if g["archive"].name == archive.name),
+        None,
+    )
+    if item is None:
+        raise RuntimeError("Published generation is not READY")
+    check = verify_offsite_generation(item)
+    if not check.get("valid"):
+        raise RuntimeError(f"Published generation failed verification: {check}")
+    sync = icloud_sync_status(dest / archive.name)
     return {
-        "offsite_archive": str(target_archive),
-        "offsite_manifest": str(target_manifest),
+        "offsite_archive": str(dest / archive.name),
+        "offsite_manifest": str(dest / manifest_path.name),
+        "offsite_ready": str(dest / (archive.name + ".ready.json")),
         "offsite_sha256": checksum,
         "source_archive": str(archive),
+        "backup_id": ready_doc["backup_id"],
+        "verify": check,
+        "sync": sync,
     }
 
 
@@ -531,11 +779,22 @@ def main() -> int:
     group.add_argument("--verify-latest", action="store_true")
     group.add_argument("--verify", default="", metavar="ARCHIVE")
     group.add_argument("--export-offsite", default="", metavar="DEST_DIR")
+    group.add_argument("--offsite-status", action="store_true")
     args = parser.parse_args()
     if args.snapshot:
         result = create_snapshot()
     elif args.export_offsite:
-        result = export_offsite(Path(args.export_offsite))
+        result = export_offsite(Path(args.export_offsite) if args.export_offsite else resolve_offsite_dir())
+    elif args.offsite_status:
+        dest = resolve_offsite_dir()
+        gens = offsite_ready_generations(dest)
+        checks = [verify_offsite_generation(g) for g in gens[-3:]]
+        result = {
+            "dest": str(dest),
+            "generations": [g["backup_id"] for g in gens],
+            "latest_verify": checks[-1] if checks else None,
+            "sync": icloud_sync_status(dest),
+        }
     else:
         archive = Path(args.verify).expanduser() if args.verify else (snapshot_pairs()[-1][0] if snapshot_pairs() else None)
         if archive is None:
