@@ -554,20 +554,24 @@ def get_local_embedder():
     global _LOCAL_EMBEDDER
     with _EMBEDDER_LOCK:
         if _LOCAL_EMBEDDER is None:
-            # Ensure fastembed is installed before importing.
-            # This provides deterministic recovery after venv rebuild.
+            # Prefer an already-installed fastembed. lazy_deps.ensure is only a
+            # recovery path for a rebuilt venv — it must not gate a working
+            # install (memory.vault is not always in LAZY_DEPS).
             try:
-                from tools.lazy_deps import ensure
-                ensure("memory.vault", prompt=False)
-            except Exception as exc:
-                import logging
-                logging.getLogger(__name__).error(
-                    "Vault vector dependency (fastembed) unavailable: %s. "
-                    "Semantic/vector retrieval will be degraded to lexical-only.",
-                    exc,
-                )
-                raise
-            from fastembed import TextEmbedding
+                from fastembed import TextEmbedding
+            except Exception:
+                try:
+                    from tools.lazy_deps import ensure
+                    ensure("memory.vault", prompt=False)
+                except Exception as exc:
+                    import logging
+                    logging.getLogger(__name__).error(
+                        "Vault vector dependency (fastembed) unavailable: %s. "
+                        "Semantic/vector retrieval will be degraded to lexical-only.",
+                        exc,
+                    )
+                    raise
+                from fastembed import TextEmbedding
 
             _LOCAL_EMBEDDER = TextEmbedding(
                 model_name=LOCAL_EMBEDDING_MODEL,

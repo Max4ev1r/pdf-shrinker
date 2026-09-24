@@ -379,7 +379,13 @@ class LocalSearchIndex:
             query_vector = self.normalized_vector(
                 next(iter(self.embedder_factory().query_embed([query])))
             )
-        except Exception:
+        except Exception as exc:
+            import logging
+            logging.getLogger(__name__).warning(
+                "Vault semantic query failed; returning no vector hits: %s: %s",
+                type(exc).__name__,
+                exc,
+            )
             return []
         rows = conn.execute(
             """

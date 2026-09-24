@@ -120,6 +120,16 @@ class MemoryGovernance:
         ids = [str(record.get("id", "")) for record in records]
         if not all(ids) or len(ids) != len(set(ids)):
             raise ValueError("Vault records must have non-empty unique IDs")
+        missing_source = [
+            str(record.get("id", ""))
+            for record in records
+            if not record.get("source")
+        ]
+        if missing_source:
+            raise ValueError(
+                "Vault records must keep provenance source: "
+                + ", ".join(missing_source)
+            )
         invalid = [
             str(record["id"])
             for record in records
@@ -187,10 +197,6 @@ class MemoryGovernance:
                 self.body_similarity(
                     body,
                     str(record.get("summary", "")),
-                ),
-                self.body_similarity(
-                    self.title_factory(body),
-                    str(record.get("title", "")),
                 ),
             )
             if score > best[0]:
@@ -264,7 +270,13 @@ class MemoryGovernance:
                 "action": "needs_user_review",
                 "risk": "high",
                 "review_status": "needs_user_review",
-                "matched_id": similar.get("id", "") if similar else "",
+                # A sensitive topic does not make the nearest unrelated fact
+                # a replacement target. Titles are labels, not fact evidence.
+                "matched_id": (
+                    similar.get("id", "")
+                    if similar and similarity >= 0.72
+                    else ""
+                ),
                 "confidence": similarity,
                 "reason": "high-risk topic or sensitive content",
             }
