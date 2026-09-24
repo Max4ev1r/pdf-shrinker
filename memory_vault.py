@@ -54,6 +54,7 @@ GOVERNANCE_REPORT_DIR = HERMES_HOME / "reports" / "memory-governance"
 
 RECORDS_PATH = VAULT_DIR / "memories.jsonl"
 HISTORY_PATH = VAULT_DIR / "history.jsonl"
+EVIDENCE_PATH = VAULT_DIR / "evidence.jsonl"
 INDEX_PATH = VAULT_DIR / "index.json"
 OUTBOX_PATH = VAULT_DIR / "index-outbox.jsonl"
 OUTBOX_STATE_PATH = VAULT_DIR / "index-outbox-state.json"
@@ -78,7 +79,7 @@ def configure_home(home: str | Path) -> None:
     environment variables.
     """
     global HERMES_HOME, MEMORIES_DIR, VAULT_DIR, TOPICS_DIR, REPORT_DIR
-    global GOVERNANCE_REPORT_DIR, RECORDS_PATH, HISTORY_PATH, INDEX_PATH
+    global GOVERNANCE_REPORT_DIR, RECORDS_PATH, HISTORY_PATH, EVIDENCE_PATH, INDEX_PATH
     global OUTBOX_PATH, OUTBOX_STATE_PATH, LOCAL_INDEX_PATH
     global LOCAL_EMBEDDING_CACHE, VAULT_DB_PATH, VAULT_LOCK_PATH
     global README_PATH, MEM0_SEED_PATH, _LOCAL_EMBEDDER
@@ -91,6 +92,7 @@ def configure_home(home: str | Path) -> None:
     GOVERNANCE_REPORT_DIR = HERMES_HOME / "reports" / "memory-governance"
     RECORDS_PATH = VAULT_DIR / "memories.jsonl"
     HISTORY_PATH = VAULT_DIR / "history.jsonl"
+    EVIDENCE_PATH = VAULT_DIR / "evidence.jsonl"
     INDEX_PATH = VAULT_DIR / "index.json"
     OUTBOX_PATH = VAULT_DIR / "index-outbox.jsonl"
     OUTBOX_STATE_PATH = VAULT_DIR / "index-outbox-state.json"
@@ -104,8 +106,10 @@ def configure_home(home: str | Path) -> None:
 
 ENTRY_DELIMITER = "\n§\n"
 SCHEMA_VERSION = 2
+CURRENT_SUPPORTED_SCHEMA = SCHEMA_VERSION
 LOCAL_INDEX_SCHEMA_VERSION = 3
 LOCAL_EMBEDDING_MODEL = "BAAI/bge-small-zh-v1.5"
+LOCAL_EMBEDDING_REVISION = ""  # set when a pinned model revision is known
 
 try:
     import fcntl
@@ -275,10 +279,37 @@ def init_database() -> None:
             """
         )
         schema_row = conn.execute("SELECT value FROM meta WHERE key='schema_version'").fetchone()
-        if schema_row is None or schema_row["value"] != str(SCHEMA_VERSION):
+        if schema_row is not None:
+            try:
+                stored_schema = int(schema_row["value"])
+            except ValueError as exc:
+                raise RuntimeError(
+                    f"Vault schema_version is not an integer: {schema_row['value']!r}"
+                ) from exc
+            if stored_schema > CURRENT_SUPPORTED_SCHEMA:
+                raise RuntimeError(
+                    "Vault schema_version "
+                    f"{stored_schema} is newer than supported "
+                    f"{CURRENT_SUPPORTED_SCHEMA}; refusing to migrate or overwrite. "
+                    "Use a matching Hermes Memory build or restore a known generation."
+                )
+            if stored_schema < CURRENT_SUPPORTED_SCHEMA:
+                conn.execute(
+                    "INSERT OR REPLACE INTO meta(key, value) VALUES('schema_version', ?)",
+                    (str(CURRENT_SUPPORTED_SCHEMA),),
+                )
+                conn.execute(
+                    "INSERT OR REPLACE INTO meta(key, value) VALUES('migrated_from_schema_version', ?)",
+                    (str(stored_schema),),
+                )
+                conn.execute(
+                    "INSERT OR REPLACE INTO meta(key, value) VALUES('migration_marker', ?)",
+                    (now_iso(),),
+                )
+        else:
             conn.execute(
                 "INSERT OR REPLACE INTO meta(key, value) VALUES('schema_version', ?)",
-                (str(SCHEMA_VERSION),),
+                (str(CURRENT_SUPPORTED_SCHEMA),),
             )
         migration = conn.execute("SELECT value FROM meta WHERE key='legacy_jsonl_migration_complete'").fetchone()
         if migration is None:
@@ -423,9 +454,22 @@ def save_records(records: list[dict[str, Any]]) -> None:
         conn.commit()
     _write_jsonl_file(RECORDS_PATH, records)
     _write_jsonl_file(HISTORY_PATH, read_jsonl(HISTORY_PATH))
+    _write_jsonl_file(EVIDENCE_PATH, read_evidence_export())
     render_topics(records)
     rebuild_local_index(records)
     write_index(records)
+
+
+def read_evidence_export() -> list[dict[str, Any]]:
+    """Portable emergency export of evidence rows (not a second SoT)."""
+    if not VAULT_DB_PATH.exists():
+        return _read_jsonl_file(EVIDENCE_PATH)
+    with db_connect(readonly=True) as conn:
+        rows = conn.execute(
+            "SELECT evidence_id,candidate_id,session_key,content_hash,source,observed_at "
+            "FROM evidence ORDER BY observed_at,evidence_id"
+        ).fetchall()
+        return [dict(row) for row in rows]
 
 
 def record_history(
@@ -599,6 +643,8 @@ def _local_index_manager() -> LocalSearchIndex:
         embedder_factory=lambda: get_local_embedder(),
         ensure_layout=ensure_layout,
         lock_factory=vault_lock,
+        embedding_revision=LOCAL_EMBEDDING_REVISION,
+        distance_metric="cosine_dot_normalized",
     )
 
 

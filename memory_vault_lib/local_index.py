@@ -34,10 +34,14 @@ class LocalSearchIndex:
         embedder_factory: Callable[[], Any],
         ensure_layout: Callable[[], None],
         lock_factory: Callable[[], ContextManager[Any]],
+        embedding_revision: str = "",
+        distance_metric: str = "cosine_dot_normalized",
     ) -> None:
         self.path = path
         self.schema_version = schema_version
         self.embedding_model = embedding_model
+        self.embedding_revision = embedding_revision
+        self.distance_metric = distance_metric
         self.alias_groups = alias_groups
         self.embedder_factory = embedder_factory
         self.ensure_layout = ensure_layout
@@ -149,6 +153,7 @@ class LocalSearchIndex:
                 ],
             )
             embedding_status = "unavailable"
+            dimensions_seen = 0
             if active:
                 try:
                     vectors = self.embedder_factory().embed(
@@ -158,6 +163,7 @@ class LocalSearchIndex:
                     vector_rows = []
                     for record, values in zip(active, vectors):
                         vector = self.normalized_vector(values)
+                        dimensions_seen = len(vector)
                         vector_rows.append(
                             (
                                 str(record["id"]),
@@ -181,7 +187,11 @@ class LocalSearchIndex:
             metadata = {
                 "schema_version": str(self.schema_version),
                 "records_fingerprint": self.active_records_fingerprint(records),
+                "embedding_provider": "fastembed",
                 "embedding_model": self.embedding_model,
+                "embedding_revision": self.embedding_revision,
+                "embedding_dimension": str(dimensions_seen) if dimensions_seen else "",
+                "distance_metric": "cosine_dot_normalized",
                 "embedding_status": embedding_status,
             }
             conn.executemany(
@@ -204,6 +214,33 @@ class LocalSearchIndex:
             finally:
                 tmp.unlink(missing_ok=True)
 
+    def index_identity(self) -> dict[str, str]:
+        return {
+            "embedding_provider": "fastembed",
+            "embedding_model": self.embedding_model,
+            "embedding_revision": self.embedding_revision,
+            "distance_metric": self.distance_metric,
+            "index_schema_version": str(self.schema_version),
+        }
+
+    def identity_mismatch(self, metadata: dict[str, str]) -> list[str]:
+        """Return stored-vs-current identity fields that force NEEDS_REINDEX."""
+        current = self.index_identity()
+        mismatches: list[str] = []
+        # Map legacy meta key schema_version → index_schema_version.
+        stored = {
+            "embedding_provider": metadata.get("embedding_provider", ""),
+            "embedding_model": metadata.get("embedding_model", ""),
+            "embedding_revision": metadata.get("embedding_revision", ""),
+            "distance_metric": metadata.get("distance_metric", ""),
+            "index_schema_version": metadata.get("index_schema_version")
+            or metadata.get("schema_version", ""),
+        }
+        for key, value in current.items():
+            if stored.get(key, "") != value:
+                mismatches.append(key)
+        return mismatches
+
     def ensure(self, records: list[dict[str, Any]]) -> bool:
         expected = self.active_records_fingerprint(records)
         try:
@@ -216,11 +253,13 @@ class LocalSearchIndex:
                         "SELECT key,value FROM index_meta"
                     ).fetchall()
                 )
+            mismatches = self.identity_mismatch(metadata)
             if (
-                metadata.get("schema_version") == str(self.schema_version)
+                not mismatches
                 and metadata.get("records_fingerprint") == expected
             ):
                 return False
+            # Identity drift → full rebuild only (never mix vectors).
         except (OSError, sqlite3.Error):
             pass
         self.rebuild(records)
