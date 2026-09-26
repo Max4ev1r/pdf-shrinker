@@ -45,6 +45,7 @@ CRITICAL_SCRIPT_NAMES = {
     "memory_vault_restore_verify_job.py",
     "memory_integrity_check.py",
     "memory_doctor.py",
+    "hermes_official_release_trigger.py",
 }
 VALID_STATUSES = {
     "pending", "active", "superseded", "archived", "disputed", "rejected",
@@ -114,6 +115,13 @@ def source_files() -> list[Path]:
     files.extend(_walk_files(HERMES_HOME / "expert-memory", skip_names={".current_sessions.json.lock"}))
     if CONFIG_PATH.exists():
         files.append(CONFIG_PATH)
+    # Canonical automation state required for production recovery.
+    # Include only durable config; skip lock/claim/output/runtime garbage.
+    cron_dir = HERMES_HOME / "cron"
+    for name in ("jobs.json", "notepad.db"):
+        path = cron_dir / name
+        if path.is_file():
+            files.append(path)
     for home in profile_homes():
         for name in ("config.yaml", "SOUL.md", "memories/USER.md", "memories/MEMORY.md"):
             path = home / name
